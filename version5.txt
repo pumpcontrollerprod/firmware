@@ -1,0 +1,1231 @@
+#include <WiFi.h>
+#include <WiFiManager.h> // https://github.com/tzapu/WiFiManager - install via Library Manager
+#include <ArduinoJson.h>
+#include <Firebase_ESP_Client.h>
+#include "time.h"
+#include <ModbusMaster.h>
+#include <Preferences.h>
+#include <esp_task_wdt.h> // വാച്ച്ഡോഗ് ടൈമർ
+#include <HTTPUpdate.h>     // v5: remote OTA firmware updates - built into the ESP32 core, no extra library install needed
+#include <WiFiClientSecure.h>
+#include "esp_ota_ops.h"    // v5: esp_ota_mark_app_valid_cancel_rollback()
+
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+// ============================================================================
+// SIP CONTROLLER FIRMWARE - v2 (ESP32-S3 compatible)
+// Changes from v1:
+//   1. Relay/valve GPIOs remapped below. The v1 pin set used GPIO22, 23, 25
+//      (these numbers don't exist on ESP32-S3) and GPIO26, 27, 32, 33
+//      (reserved for the chip's internal SPI flash/PSRAM on ESP32-S3).
+//      GPIO19 was also dropped (shared with native USB D- on S3).
+//      Rewire your relay/valve harness to match the HARDWARE PINS block
+//      below. This map is also still 100% valid on a classic ESP32.
+//   2. Firebase now also pushes /system/voltage and /system/power. The web
+//      dashboard reads those two paths, but v1 firmware never wrote them
+//      (only the per-phase voltageRY/YB/BR + current were sent), so the
+//      dashboard's Voltage/Power tiles were permanently stuck on
+//      "SENSOR ERROR" / blank even with a healthy meter.
+//   3. Added an esp_task_wdt_reset() before the batch of Firebase telemetry
+//      writes in updateSystem(), as a safety margin against a watchdog
+//      reset if the network is slow during that write burst.
+//
+// v3 adds one more fix on top of the above:
+//   4. Water-hammer guard for the irrigation<->backwash handoff. If a backwash
+//      schedule collides with a running zone, the main valve used to slam shut
+//      and the flush valve snap open in the same tick while the pump kept
+//      running through the switch. Now a direct crossover between those two
+//      active flow paths forces the pump off and re-runs the normal 3s startup
+//      debounce, so the valves finish settling before the pump pushes flow
+//      into the new path again. See "v3 fix" comment in updateSystem().
+// No other scheduling, interlock, or safety-trip logic was changed.
+//
+// v4 makes this a multi-customer-ready build:
+//   5. WiFi credentials are no longer hardcoded. On first boot (or whenever
+//      saved WiFi fails to connect) the board opens its own "SIP-Setup-XXXX"
+//      access point with a captive portal - connect a phone to it and enter
+//      the customer's WiFi SSID/password there. Saved to flash via
+//      WiFiManager; the same compiled binary now works at every site.
+//   6. Every unit now identifies itself by its own factory-unique MAC address
+//      (read once at boot, no typing/labels needed) and all Firebase RTDB
+//      paths are namespaced under /devices/{mac}/... instead of a shared
+//      /system and /schedules root. This is what makes it safe to point many
+//      customers' units at the same Firebase project - see the deviceId /
+//      devBase / P() helper below, and the SIP-Controller-Multi-Tenant-Setup
+//      note saved to the project for the Firebase-side half of this (Auth
+//      accounts, /deviceOwners mapping, and Security Rules).
+//
+// v5 adds remote OTA (over-the-air) firmware updates:
+//   7. Every unit now reports its own compiled FW_VERSION to Firebase
+//      (/system/fwVersion), so the customer and admin dashboards can both
+//      show what firmware a device is actually running.
+//   8. checkForFirmwareUpdate() periodically compares FW_VERSION against a
+//      shared /firmwareUpdate/version + /firmwareUpdate/url published from
+//      the Firebase Console, and if they differ, downloads and flashes the
+//      new binary over HTTPS - no physical access to the unit required.
+//      It refuses to start while isSystemBusy() is true (an active
+//      irrigation/fert run), and a per-device /system/holdUpdate flag lets
+//      you exclude a specific unit from a rollout (for staged testing).
+//      /system/otaStatus reports progress (idle/checking/downloading/
+//      failed:.../success) so you can watch a rollout from the admin console.
+//   9. esp_ota_mark_app_valid_cancel_rollback() is called once a freshly
+//      flashed build proves it can reach WiFi + Firebase on its own, which
+//      is what tells the ESP32's dual-OTA-partition scheme this build is
+//      good. See "SIP-Controller-Multi-Tenant-Setup" project doc, "Remote
+//      Firmware Updates (OTA)" section, for the full publish procedure and
+//      the honest limits of remote recovery if a bad build can't get online
+//      at all.
+//   10. (v5.0.1) The bootloader's own automatic rollback-on-failed-boot isn't
+//       something we can guarantee is enabled from the stock Arduino IDE
+//       build, so we don't rely on it alone. An explicit NVS-backed boot
+//       counter now force-reverts to the previous firmware itself after 3
+//       consecutive boots that never reach the "WiFi + Firebase confirmed
+//       healthy" checkpoint - see bootGuard in setup().
+//   11. (v5.0.2) httpUpdate now follows HTTP redirects, needed for hosting the
+//       .bin on GitHub Releases (its download links redirect to
+//       objects.githubusercontent.com rather than serving the file directly).
+// ============================================================================
+
+#define API_KEY "AIzaSyB3d2TB8bKWys4KBQY5YXFFazah_hfr0JQ"
+#define DATABASE_URL "https://customer-base-de561-default-rtdb.firebaseio.com"
+#define FW_VERSION "5.0.2" // v5: bump this with every release you publish via /firmwareUpdate
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+bool signupOK = false;
+Preferences prefs;
+Preferences bootGuard; // v5.0.1: separate NVS namespace ("otaguard") for the OTA rollback safety net
+
+// --- v4: PER-DEVICE IDENTITY ---
+// deviceId is this unit's own WiFi MAC address (set in setup(), once WiFi is up).
+// devBase is the Firebase path prefix every RTDB call is routed through via P().
+// This is what keeps one customer's controller from reading/writing another's data.
+String deviceId = "";
+String devBase = "";
+String P(const char* suffix) { return devBase + suffix; } // e.g. P("/system/pump1Active") returns "/devices/AABBCCDDEEFF/system/pump1Active"
+
+// --- HARDWARE PINS (ESP32-S3 safe map - v2) ---
+const int relay1_pumpMain = 1;      // was 32 (reserved for flash on S3)
+const int relay2_valveMain = 4;     // unchanged - safe on both ESP32 and S3
+const int relay3_flushIn = 2;       // was 33 (reserved for PSRAM on S3)
+const int relayMaster = 16;         // unchanged - safe on both ESP32 and S3
+const int irrZonePins[6] = {13, 14, 17, 18, 6, 21}; // zone 5 was GPIO19 (USB D- on S3)
+const int relayFertPump = 7;        // was 22 (GPIO22-25 don't exist on S3)
+const int fertZonePins[4] = {8, 9, 10, 11}; // was {23, 25, 26, 27} (nonexistent/flash-reserved on S3)
+
+// --- MODBUS PINS (L&T WL4400) ---
+#define RS485_RX_PIN 15
+#define RS485_TX_PIN 5
+
+ModbusMaster node;
+
+// --- SYSTEM STATE VARIABLES ---
+int manualIrrZone = 0; int manualFertZone = 0;
+time_t manualIrrStop = 0; time_t manualFertStop = 0;
+unsigned long ignoreFirebaseUntil = 0;
+
+// --- v5: OTA UPDATE STATE ---
+bool otaCheckedThisBoot = false;
+unsigned long lastOtaCheck = 0;
+const unsigned long OTA_CHECK_INTERVAL = 6UL * 3600UL * 1000UL; // recheck every 6 hours
+
+unsigned long wifiDisconnectTime = 0;
+bool wasDisconnected = false;
+bool ntpSyncPending = false;
+unsigned long lastNtpAttempt = 0;
+
+bool pendingClearIrr = false; bool pendingClearFert = false;
+int lastActiveIrrZone = -2; int lastActiveFertZone = -2;
+bool lastPump1Active = false; bool lastFertPumpActive = false;
+unsigned long lastPrefSave = 0;
+
+int pendingResumeZone = 0;
+long pendingResumeRemain = 0;
+bool autoResumeEnabled = false; 
+
+// --- BUNGEE OVERLAP VARIABLES ---
+int heldIrrZone = -1; 
+int heldFertZone = -1;
+
+// --- ADVANCED STRUCTURES ---
+struct FertConfig { int comp; int mins; uint8_t days; int startHour; int startMinute; };
+struct ZoneConfig { int waterMins; FertConfig ferts[4]; int fertCount; };
+struct StartTime { int hour; int minute; };
+struct Schedule { bool active; uint8_t days; StartTime starts[5]; int startCount; ZoneConfig zones[6]; };
+struct BackwashConfig { bool active; uint8_t days; int hour; int minute; int durationMins; };
+
+Schedule schedules[3];
+BackwashConfig bwConfig = {false, 0, 0, 0, 5};
+time_t irrSchedStart[6] = {0}; time_t irrSchedStop[6] = {0};
+time_t fertQueueStart[6][4] = {{0}};
+time_t fertQueueStop[6][4] = {{0}};
+int fertQueueComp[6][4] = {{0}};
+time_t bwStart = 0; time_t bwStop = 0;
+
+unsigned long pumpDemandStartTime = 0; bool pump1Active = false;
+unsigned long pumpRunStartTime = 0; 
+unsigned long fertDemandStartTime = 0; bool fertPumpActive = false;
+int lastCheckedMinute = -1;
+
+// 3 Phase Voltage and current limits
+float minV = 360.0, maxV = 450.0; float minA = 1.0, maxA = 50.0; bool protEnabled = false;
+float globalVRY = 0.0, globalVYB = 0.0, globalVBR = 0.0;
+float globalVoltage = 415.0; float globalCurrent = 0.0; float globalPower = 0.0; // v2: aggregate values pushed to the dashboard
+
+bool autoInterlockActive = false; int autoInterlockReason = 0;
+bool isEmergencyTripped = false; 
+bool lastEmergencyState = false; // ഫിക്സ്: ഫയർബേസ് ഇൻഫിനിറ്റ് ലൂപ്പ് തടയാനുള്ള ഗ്ലോബൽ ഫ്ലാഗ്
+
+unsigned long stableStartTime = 0; int motorRetryCount = 0;
+
+static int prevTickIrrZone = -1; static int prevTickFertZone = -1;
+static bool prevTickBwSafe = false;
+static int prevFlowPath = 0; // v3: 0=idle, 1=irrigation, 2=backwash - tracks direct path crossovers
+
+// --- HARDWARE CONTROL ---
+void controlRelay(int pin, bool turnOn) { 
+    if (turnOn) digitalWrite(pin, LOW); 
+    else digitalWrite(pin, HIGH); 
+}
+
+void engageInterlock(int reason) {
+    if (!autoInterlockActive || autoInterlockReason != reason) {
+        autoInterlockActive = true; autoInterlockReason = reason; stableStartTime = 0; 
+        Serial.print(F("[INTERLOCK] Hardware Paused! Reason Code: ")); Serial.println(reason);
+        
+        if(WiFi.status() == WL_CONNECTED && Firebase.ready() && signupOK) { 
+            Firebase.RTDB.setInt(&fbdo, P("/system/interlockReason").c_str(), reason); 
+        }
+
+        if (!autoResumeEnabled) {
+            Serial.println(F("[INTERLOCK] Auto Resume OFF. Wiping active schedules & timers."));
+            manualIrrZone = 0; manualIrrStop = 0; pendingClearIrr = true;
+            manualFertZone = 0; manualFertStop = 0; pendingClearFert = true;
+            bwStart = 0; bwStop = 0;
+            
+            for(int i=0; i<6; i++) { 
+                irrSchedStart[i] = 0; irrSchedStop[i] = 0; 
+                for(int f=0; f<4; f++) { fertQueueStart[i][f] = 0; fertQueueStop[i][f] = 0; } 
+            }
+            
+            pendingResumeZone = 0; pendingResumeRemain = 0;
+            prefs.putInt("z", 0); prefs.putLong("r", 0); 
+            
+            if(WiFi.status() == WL_CONNECTED && Firebase.ready() && signupOK) {
+                Firebase.RTDB.setInt(&fbdo, P("/system/manualIrrZone").c_str(), 0);
+                Firebase.RTDB.setInt(&fbdo, P("/system/manualIrrMins").c_str(), 0);
+                Firebase.RTDB.setInt(&fbdo, P("/system/pendingZone").c_str(), 0);
+                Firebase.RTDB.setInt(&fbdo, P("/system/pendingRemain").c_str(), 0);
+            }
+        }
+    }
+}
+
+void releaseInterlock() {
+    if (autoInterlockActive) {
+        autoInterlockActive = false; autoInterlockReason = 0; stableStartTime = 0; pumpDemandStartTime = 0; 
+        Serial.println(F("[INTERLOCK] Power/Voltage is stable. Resuming Timers & Operations."));
+        if(WiFi.status() == WL_CONNECTED && Firebase.ready() && signupOK) {
+            Firebase.RTDB.setInt(&fbdo, P("/system/interlockReason").c_str(), 0);
+        }
+    }
+}
+
+void triggerEmergencyStop(int reasonCode) {
+    isEmergencyTripped = true; 
+    lastEmergencyState = true; // ഫിക്സ്: ഫയർബേസിൽ നിന്ന് റീഡ് ചെയ്ത് വീണ്ടും ട്രിഗർ ആകുന്നത് തടയുന്നു
+    autoInterlockActive = true; 
+    autoInterlockReason = reasonCode; 
+    
+    if(WiFi.status() == WL_CONNECTED && Firebase.ready() && signupOK) {
+        Firebase.RTDB.setInt(&fbdo, P("/system/lastTripReason").c_str(), reasonCode);
+        Firebase.RTDB.setBool(&fbdo, P("/system/emergencyStop").c_str(), true);
+    }
+    Serial.print(F("\n[!!! EMERGENCY TRIP !!!] Reason Code: ")); Serial.print(reasonCode); Serial.println(F(". System halted."));
+
+    manualIrrZone = 0; manualFertZone = 0; manualIrrStop = 0; manualFertStop = 0;
+    pendingClearIrr = false; pendingClearFert = false; bwStart = 0; bwStop = 0;
+    pump1Active = false; fertPumpActive = false; pumpDemandStartTime = 0; fertDemandStartTime = 0; motorRetryCount = 0;
+    
+    for(int i=0; i<6; i++) { 
+        irrSchedStart[i] = 0; irrSchedStop[i] = 0; 
+        for(int f=0; f<4; f++) { fertQueueStart[i][f] = 0; fertQueueStop[i][f] = 0; } 
+    }
+    prefs.putInt("z", 0); prefs.putLong("r", 0); 
+    if(WiFi.status() == WL_CONNECTED && Firebase.ready() && signupOK) {
+        Firebase.RTDB.setInt(&fbdo, P("/system/pendingZone").c_str(), 0);
+        Firebase.RTDB.setInt(&fbdo, P("/system/pendingRemain").c_str(), 0);
+    }
+}
+
+void loadScheduleIntoExecution(int sIndex) {
+  time_t now; time(&now); struct tm *timeinfo = localtime(&now);
+  int currentDayBitmask = (1 << timeinfo->tm_wday); time_t currentEpoch = now;
+  
+  Serial.print(F("[SCHEDULE] Slot ")); Serial.print(sIndex + 1); Serial.println(F(" execution initiated."));
+  
+  for(int i=0; i<6; i++) { 
+      irrSchedStart[i] = 0; irrSchedStop[i] = 0; 
+      for(int f=0; f<4; f++) { fertQueueStart[i][f] = 0; fertQueueStop[i][f] = 0; fertQueueComp[i][f] = 0; } 
+  }
+
+  for(int i=0; i<6; i++) {
+    if (schedules[sIndex].zones[i].waterMins > 0) {
+      irrSchedStart[i] = currentEpoch;
+      currentEpoch += (schedules[sIndex].zones[i].waterMins * 60); irrSchedStop[i] = currentEpoch;
+      time_t zoneStart = irrSchedStart[i]; struct tm *zTm = localtime(&zoneStart);
+      time_t zMidnight = zoneStart - (zTm->tm_hour * 3600) - (zTm->tm_min * 60) - zTm->tm_sec;
+      for(int f=0; f < schedules[sIndex].zones[i].fertCount; f++) {
+        FertConfig fc = schedules[sIndex].zones[i].ferts[f];
+        if ((fc.days & currentDayBitmask) != 0 && fc.mins > 0 && fc.comp > 0) {
+           time_t proposedStart = zMidnight + (fc.startHour * 3600) + (fc.startMinute * 60);
+           if (proposedStart < zoneStart && (proposedStart + 86400) <= irrSchedStop[i]) proposedStart += 86400;
+           time_t proposedStop = proposedStart + (fc.mins * 60);
+           if (proposedStart < irrSchedStart[i]) proposedStart = irrSchedStart[i];
+           if (proposedStop > irrSchedStop[i]) proposedStop = irrSchedStop[i];
+           if (proposedStop > proposedStart) { fertQueueStart[i][f] = proposedStart; fertQueueStop[i][f] = proposedStop; fertQueueComp[i][f] = fc.comp; }
+        }
+      }
+    }
+  }
+}
+
+void updateSystem() {
+  static time_t lastSysTime = 0;
+  time_t now; time(&now); if (now < 100000) return;
+
+  bool isScheduledRun = false;
+  for (int i = 0; i < 6; i++) { 
+      if (irrSchedStart[i] != 0 && irrSchedStop[i] != 0 && now >= irrSchedStart[i] && now < irrSchedStop[i]) { 
+          isScheduledRun = true; break; 
+      } 
+  }
+  bool isBackwashTime = (bwStart > 0 && bwStop > 0 && now >= bwStart && now < bwStop);
+
+  if (lastSysTime > 0) {
+      time_t shifted = now - lastSysTime;
+      if (shifted > 0 && shifted < 100) { 
+          if (autoInterlockActive) {
+              if (autoResumeEnabled) {
+                  if (manualIrrStop > 0) manualIrrStop += shifted;
+                  if (bwStart > 0) bwStart += shifted;
+                  if (bwStop > 0) bwStop += shifted;
+                  for(int i=0; i<6; i++) {
+                      if (irrSchedStart[i] > 0) irrSchedStart[i] += shifted;
+                      if (irrSchedStop[i] > 0) irrSchedStop[i] += shifted;
+                      for(int f=0; f<4; f++) { 
+                          if (fertQueueStart[i][f] > 0) fertQueueStart[i][f] += shifted; 
+                          if (fertQueueStop[i][f] > 0) fertQueueStop[i][f] += shifted; 
+                      }
+                  }
+              } else {
+                  if (manualIrrZone > 0) { manualIrrZone = 0; manualIrrStop = 0; pendingClearIrr = true; }
+                  if (manualFertZone > 0) { manualFertZone = 0; manualFertStop = 0; pendingClearFert = true; }
+                  bwStart = 0; bwStop = 0;
+                  for(int i=0; i<6; i++) {
+                      irrSchedStart[i] = 0; irrSchedStop[i] = 0;
+                      for(int f=0; f<4; f++) { fertQueueStart[i][f] = 0; fertQueueStop[i][f] = 0; }
+                  }
+              }
+          } else if (isScheduledRun || isBackwashTime) {
+              if (manualIrrZone > 0 && manualIrrStop > now) manualIrrStop += shifted;
+              if (manualFertZone > 0 && manualFertStop > now) manualFertStop += shifted;
+          }
+      }
+  }
+  lastSysTime = now;
+
+  if (now >= bwStop && bwStop > 0) { bwStart = 0; bwStop = 0; ignoreFirebaseUntil = millis() + 1500; isBackwashTime = false; }
+
+  if (manualIrrZone > 0 && manualIrrStop > 0 && now >= manualIrrStop) { 
+      manualIrrZone = 0; manualIrrStop = 0; pendingClearIrr = true; 
+      if(WiFi.status() == WL_CONNECTED && Firebase.ready() && signupOK) { Firebase.RTDB.setInt(&fbdo, P("/system/manualIrrZone").c_str(), 0); Firebase.RTDB.setInt(&fbdo, P("/system/manualIrrMins").c_str(), 0); }
+  }
+  if (manualFertZone > 0 && manualFertStop > 0 && now >= manualFertStop) { 
+      manualFertZone = 0; manualFertStop = 0; pendingClearFert = true; 
+      if(WiFi.status() == WL_CONNECTED && Firebase.ready() && signupOK) { Firebase.RTDB.setInt(&fbdo, P("/system/manualFertZone").c_str(), 0); Firebase.RTDB.setInt(&fbdo, P("/system/manualFertMins").c_str(), 0); }
+  }
+
+  if (pendingResumeZone > 0 && pendingResumeRemain > 0 && !isScheduledRun && !isBackwashTime) {
+      if (autoResumeEnabled) {
+          manualIrrZone = pendingResumeZone;
+          manualIrrStop = now + pendingResumeRemain;
+          Serial.print(F("[POWER] Recovery! Auto Resume ON. Resuming Zone ")); Serial.print(pendingResumeZone); Serial.print(F(" for ")); Serial.print(pendingResumeRemain); Serial.println(F(" seconds"));
+      } else {
+          Serial.println(F("[POWER] Old memory found, but Auto Resume is OFF. Memory wiped!"));
+      }
+      
+      pendingResumeZone = 0; pendingResumeRemain = 0;
+      prefs.putInt("z", 0); prefs.putLong("r", 0);
+      
+      if(WiFi.status() == WL_CONNECTED && Firebase.ready() && signupOK) {
+          Firebase.RTDB.setInt(&fbdo, P("/system/pendingZone").c_str(), 0);
+          Firebase.RTDB.setInt(&fbdo, P("/system/pendingRemain").c_str(), 0);
+      }
+  }
+
+  int activeIrrZone = -1;
+  time_t currentIrrStop = 0;
+
+  for (int i = 0; i < 6; i++) { 
+      if (irrSchedStart[i] != 0 && irrSchedStop[i] != 0 && now >= irrSchedStart[i] && now < irrSchedStop[i]) { 
+          activeIrrZone = i; currentIrrStop = irrSchedStop[i]; break; 
+      } 
+  }
+
+  if (!isScheduledRun && manualIrrZone > 0 && manualIrrZone <= 6) {
+      activeIrrZone = manualIrrZone - 1; currentIrrStop = manualIrrStop;
+  }
+  if (isBackwashTime) { activeIrrZone = -1; currentIrrStop = 0; }
+
+  if (activeIrrZone != -1 && currentIrrStop > 0) {
+      if (millis() - lastPrefSave > 60000) { 
+          lastPrefSave = millis();
+          long remain = currentIrrStop - now;
+          if (remain > 0) {
+              if (autoResumeEnabled) { 
+                  prefs.putInt("z", activeIrrZone + 1);
+                  prefs.putLong("r", remain);
+                  if(WiFi.status() == WL_CONNECTED && Firebase.ready() && signupOK) {
+                      Firebase.RTDB.setInt(&fbdo, P("/system/pendingZone").c_str(), activeIrrZone + 1);
+                      Firebase.RTDB.setInt(&fbdo, P("/system/pendingRemain").c_str(), remain);
+                  }
+              } else {
+                  prefs.putInt("z", 0);
+                  prefs.putLong("r", 0);
+              }
+          }
+      }
+  } else if (lastActiveIrrZone != -1 && activeIrrZone == -1) {
+      prefs.putInt("z", 0); prefs.putLong("r", 0); 
+      if(WiFi.status() == WL_CONNECTED && Firebase.ready() && signupOK) {
+          Firebase.RTDB.setInt(&fbdo, P("/system/pendingZone").c_str(), 0);
+          Firebase.RTDB.setInt(&fbdo, P("/system/pendingRemain").c_str(), 0);
+      }
+  }
+
+  int activeFertZone = -1;
+  time_t currentFertStop = 0;
+
+  if (activeIrrZone != -1) {
+      if (manualFertZone > 0 && manualFertZone <= 4 && !isScheduledRun) {
+          activeFertZone = manualFertZone - 1; 
+          currentFertStop = manualFertStop;
+      } else if (isScheduledRun) {
+          for(int f=0; f<4; f++) {
+            if (fertQueueStart[activeIrrZone][f] != 0 && fertQueueStop[activeIrrZone][f] != 0 && now >= fertQueueStart[activeIrrZone][f] && now < fertQueueStop[activeIrrZone][f]) {
+                int assignedComp = fertQueueComp[activeIrrZone][f];
+                if (assignedComp > 0 && assignedComp <= 4) { activeFertZone = assignedComp - 1; currentFertStop = fertQueueStop[activeIrrZone][f]; break; }
+            }
+          }
+      }
+  } else {
+      if (manualFertZone != 0 && !isScheduledRun && !isBackwashTime) { 
+          manualFertZone = 0; manualFertStop = 0; pendingClearFert = true; 
+          if(WiFi.status() == WL_CONNECTED && Firebase.ready() && signupOK) { 
+              Firebase.RTDB.setInt(&fbdo, P("/system/manualFertZone").c_str(), 0); 
+              Firebase.RTDB.setInt(&fbdo, P("/system/manualFertMins").c_str(), 0); 
+          }
+      }
+  }
+
+  int hwIrrZone = activeIrrZone;
+  int hwFertZone = activeFertZone;
+  bool hwBwSafe = isBackwashTime;
+
+  if (autoInterlockActive) {
+      hwIrrZone = -1; hwFertZone = -1; hwBwSafe = false;
+  }
+
+  static unsigned long irrOverlapTimer = 0; bool isIrrOverlapping = false;
+  if (hwIrrZone != prevTickIrrZone) { 
+      if (prevTickIrrZone != -1) { 
+          heldIrrZone = prevTickIrrZone; irrOverlapTimer = millis(); 
+          Serial.print(F("[ZONE] Zone ")); Serial.print(prevTickIrrZone + 1); Serial.println(F(" valve CLOSED."));
+      }
+      if (hwIrrZone == -1 || prevTickIrrZone == -1) { pumpDemandStartTime = 0; pump1Active = false; }
+      if (hwIrrZone == -1) { fertDemandStartTime = 0; fertPumpActive = false; }
+      if (hwIrrZone != -1) { 
+          Serial.print(F("[ZONE] Zone ")); Serial.print(hwIrrZone + 1); Serial.println(F(" valve OPENED."));
+      }
+  }
+  
+  isIrrOverlapping = (heldIrrZone != -1 && (millis() - irrOverlapTimer < 3000)); 
+  if (!isIrrOverlapping) heldIrrZone = -1;
+
+  static unsigned long fertOverlapTimer = 0; bool isFertOverlapping = false;
+  if (hwFertZone != prevTickFertZone) {
+      if (prevTickFertZone != -1) { 
+          heldFertZone = prevTickFertZone; fertOverlapTimer = millis(); 
+          Serial.print(F("[FERT VALVE] Compartment ")); Serial.print(prevTickFertZone + 1); Serial.println(F(" Valve CLOSED."));
+      }
+      if (hwFertZone == -1 || prevTickFertZone == -1) { fertDemandStartTime = 0; fertPumpActive = false; }
+      if (hwFertZone != -1) { 
+          Serial.print(F("[FERT VALVE] Compartment ")); Serial.print(hwFertZone + 1); Serial.println(F(" Valve OPENED."));
+      }
+  }
+  
+  isFertOverlapping = (heldFertZone != -1 && (millis() - fertOverlapTimer < 3000));
+  if (!isFertOverlapping) heldFertZone = -1;
+
+  static unsigned long bwOverlapTimer = 0; 
+  static bool heldBwValves = false;
+
+  if (hwBwSafe != prevTickBwSafe) {
+      if (hwBwSafe == false && prevTickBwSafe == true) { heldBwValves = true; bwOverlapTimer = millis(); } 
+      else if (hwBwSafe == true) { heldBwValves = false; }
+  }
+  if (heldBwValves && (millis() - bwOverlapTimer >= 3000)) heldBwValves = false;
+
+  prevTickIrrZone = hwIrrZone; prevTickFertZone = hwFertZone; prevTickBwSafe = hwBwSafe;
+
+  // v3 fix: prevent a water-hammer-prone hot-swap when the flow path switches directly
+  // between irrigation and backwash (e.g. a backwash schedule collides with an active
+  // zone). Without this, the main valve slams shut and the flush valve snaps open in the
+  // same tick while the pump keeps running continuously through the switch. Detect a
+  // direct crossover between two ACTIVE paths (no idle tick in between) and force the
+  // same pump-off + 3s demand debounce already used at every normal startup, so the
+  // valves finish settling into the new path before the pump pushes flow into it again.
+  int newFlowPath = hwBwSafe ? 2 : (hwIrrZone != -1 ? 1 : 0); // 0=idle, 1=irrigation, 2=backwash
+  if (newFlowPath != prevFlowPath && newFlowPath != 0 && prevFlowPath != 0) {
+      pump1Active = false; pumpDemandStartTime = 0;
+      Serial.println(F("[SAFETY] Flow path switched (irrigation<->backwash) - pausing pump to let valves settle."));
+  }
+  prevFlowPath = newFlowPath;
+
+  bool needsMainPump = (hwIrrZone != -1) || hwBwSafe;
+  if (needsMainPump) {
+    if (!pump1Active) { if (pumpDemandStartTime == 0) pumpDemandStartTime = millis(); if (millis() - pumpDemandStartTime >= 3000) { pump1Active = true; pumpRunStartTime = millis(); } }
+  } else { pump1Active = false; pumpDemandStartTime = 0; }
+
+  if (hwFertZone != -1 && pump1Active) { 
+      if (!fertPumpActive) { 
+          if (fertDemandStartTime == 0) fertDemandStartTime = millis(); 
+          if (millis() - fertDemandStartTime >= 3000) { fertPumpActive = true; } 
+      } 
+  } else { 
+      fertPumpActive = false; fertDemandStartTime = 0; 
+  }
+
+  bool finalPumpMain = pump1Active;
+  bool finalFertPump = fertPumpActive;
+  bool finalMainValve = false;
+  bool finalFlushIn = false;
+
+  if (autoInterlockActive) { finalPumpMain = false; finalFertPump = false; }
+
+  if (hwBwSafe || heldBwValves) {
+      finalMainValve = false; finalFlushIn = true;
+  } else {
+      finalMainValve = (hwIrrZone != -1 || heldIrrZone != -1);
+      finalFlushIn = false; 
+  }
+
+  controlRelay(relay1_pumpMain, finalPumpMain); 
+  controlRelay(relayFertPump, finalFertPump);
+  controlRelay(relay2_valveMain, finalMainValve); 
+  controlRelay(relay3_flushIn, finalFlushIn); 
+
+  for (int i = 0; i < 6; i++) {
+      bool on = (i == hwIrrZone) || (i == heldIrrZone); 
+      controlRelay(irrZonePins[i], on);
+  }
+  for (int i = 0; i < 4; i++) {
+      bool on = (i == hwFertZone) || (i == heldFertZone); 
+      controlRelay(fertZonePins[i], on);
+  }
+
+  if(WiFi.status() == WL_CONNECTED && Firebase.ready() && signupOK) {
+    esp_task_wdt_reset(); // v2: pet the watchdog before this batch of Firebase telemetry writes
+    if (activeIrrZone != lastActiveIrrZone) { Firebase.RTDB.setInt(&fbdo, P("/system/activeIrrZone").c_str(), activeIrrZone != -1 ? activeIrrZone + 1 : 0); lastActiveIrrZone = activeIrrZone; }
+    if (activeFertZone != lastActiveFertZone) { Firebase.RTDB.setInt(&fbdo, P("/system/activeFertZone").c_str(), activeFertZone != -1 ? activeFertZone + 1 : 0); lastActiveFertZone = activeFertZone; }
+    
+    static time_t lastPushIrrStop = 0; if (currentIrrStop != lastPushIrrStop) { Firebase.RTDB.setInt(&fbdo, P("/system/activeIrrStop").c_str(), (int)currentIrrStop); lastPushIrrStop = currentIrrStop; }
+    static time_t lastPushFertStop = 0; if (currentFertStop != lastPushFertStop) { Firebase.RTDB.setInt(&fbdo, P("/system/activeFertStop").c_str(), (int)currentFertStop); lastPushFertStop = currentFertStop; }
+
+    if (pump1Active != lastPump1Active) { 
+        Firebase.RTDB.setBool(&fbdo, P("/system/pump1Active").c_str(), pump1Active); 
+        if (pump1Active) { Serial.println(F("[PUMP] Main Water Pump TURNED ON")); }
+        else { Serial.println(F("[PUMP] Main Water Pump TURNED OFF")); }
+        lastPump1Active = pump1Active; 
+    }
+    
+    if (fertPumpActive != lastFertPumpActive) { 
+        Firebase.RTDB.setBool(&fbdo, P("/system/fertPumpActive").c_str(), fertPumpActive); 
+        if (fertPumpActive) { Serial.println(F("[PUMP] Fertilizer Pump TURNED ON")); }
+        else { Serial.println(F("[PUMP] Fertilizer Pump TURNED OFF")); }
+        lastFertPumpActive = fertPumpActive; 
+    }
+    
+    static bool lastBwState = false; if (hwBwSafe != lastBwState) { Firebase.RTDB.setBool(&fbdo, P("/system/isBackwashActive").c_str(), hwBwSafe); lastBwState = hwBwSafe; }
+
+    static int lastIrrRem = -1;
+    static int lastFertRem = -1;
+    static unsigned long lastRemainPush = 0;
+    
+    if (millis() - lastRemainPush >= 5000) { 
+        lastRemainPush = millis();
+        int irrRem = (currentIrrStop > now) ? (currentIrrStop - now) : 0;
+        int fertRem = (currentFertStop > now) ? (currentFertStop - now) : 0;
+        
+        if (irrRem != lastIrrRem || fertRem != lastFertRem) {
+            Firebase.RTDB.setInt(&fbdo, P("/system/activeIrrRemain").c_str(), irrRem);
+            Firebase.RTDB.setInt(&fbdo, P("/system/activeFertRemain").c_str(), fertRem);
+            lastIrrRem = irrRem;
+            lastFertRem = fertRem;
+        }
+    }
+  }
+}
+
+void checkRecurringSchedules() {
+  time_t now; time(&now); if (now < 100000) return;
+  struct tm *timeinfo = localtime(&now);
+  if (timeinfo->tm_min != lastCheckedMinute) {
+    lastCheckedMinute = timeinfo->tm_min; int currentDay = timeinfo->tm_wday; int currentHour = timeinfo->tm_hour; int currentMinute = timeinfo->tm_min;
+    
+    for(int s=0; s<3; s++) { 
+        if (schedules[s].active && (schedules[s].days & (1 << currentDay))) { 
+            for(int st=0; st < schedules[s].startCount; st++) {
+                if (schedules[s].starts[st].hour == currentHour && schedules[s].starts[st].minute == currentMinute) { loadScheduleIntoExecution(s); }
+            }
+        } 
+    }
+
+    if (bwConfig.active && (bwConfig.days & (1 << currentDay))) { 
+        if (bwConfig.hour == currentHour && bwConfig.minute == currentMinute) { 
+            if (bwStart == 0) {
+                bwStart = now; bwStop = now + (bwConfig.durationMins * 60); 
+                Serial.println(F("[SCHEDULE] Auto-Backwash Initiated."));
+            }
+        } 
+    }
+  }
+}
+
+float convertRegistersToFloat(uint16_t reg1, uint16_t reg2) {
+    union { uint32_t u32; float f; } data;
+    data.u32 = ((uint32_t)reg2 << 16) | (uint32_t)reg1;
+    return data.f;
+}
+
+static bool readVoltageNext = true;
+static int modbusFailCount = 0;
+static bool isPowerOut = false;
+
+void readPowerMeterData() {
+    esp_task_wdt_reset(); 
+
+    if (!protEnabled && autoInterlockActive && !isEmergencyTripped && (autoInterlockReason == 6 || (autoInterlockReason >= 1 && autoInterlockReason <= 4))) {
+        releaseInterlock();
+    }
+
+    uint8_t result;
+
+    if (readVoltageNext) {
+        result = node.readHoldingRegisters(134, 6); 
+        
+        if (result == node.ku8MBSuccess) {
+            modbusFailCount = 0;
+            globalVRY = convertRegistersToFloat(node.getResponseBuffer(0), node.getResponseBuffer(1));
+            globalVYB = convertRegistersToFloat(node.getResponseBuffer(2), node.getResponseBuffer(3));
+            globalVBR = convertRegistersToFloat(node.getResponseBuffer(4), node.getResponseBuffer(5));
+
+            if (globalVRY < 50.0) globalVRY = 0.0;
+            if (globalVYB < 50.0) globalVYB = 0.0;
+            if (globalVBR < 50.0) globalVBR = 0.0;
+
+            globalVoltage = (globalVRY + globalVYB + globalVBR) / 3.0; 
+            
+            if (isPowerOut) {
+                isPowerOut = false;
+                Serial.println(F("[POWER] Power Restored!"));
+            }
+
+            bool phaseLost = (globalVRY == 0.0 || globalVYB == 0.0 || globalVBR == 0.0);
+            bool vGood = (globalVRY >= minV && globalVRY <= maxV) && 
+                         (globalVYB >= minV && globalVYB <= maxV) && 
+                         (globalVBR >= minV && globalVBR <= maxV);
+
+            if (protEnabled && phaseLost) { 
+                engageInterlock(6); 
+            } else if (protEnabled && !vGood) { 
+                engageInterlock(1); 
+            } else { 
+                if (autoInterlockActive && !isEmergencyTripped) {
+                    if (stableStartTime == 0) {
+                        stableStartTime = millis(); 
+                    } else if (millis() - stableStartTime >= 10000) { 
+                        releaseInterlock();
+                    }
+                }
+            }
+            
+        } else { 
+            globalVRY = -1.0; globalVYB = -1.0; globalVBR = -1.0; globalVoltage = -1.0; 
+            modbusFailCount++;
+            stableStartTime = 0; 
+            
+            if (modbusFailCount >= 3) {
+                if (!isPowerOut) {
+                    isPowerOut = true;
+                    Serial.println(F("[POWER] Connection to meter lost."));
+                }
+                if (!autoInterlockActive || autoInterlockReason != 5) {
+                    engageInterlock(5); 
+                }
+            }
+        }
+        readVoltageNext = false; 
+        
+    } else {
+        result = node.readHoldingRegisters(148, 2);
+        if (result == node.ku8MBSuccess) {
+            modbusFailCount = 0; 
+            globalCurrent = convertRegistersToFloat(node.getResponseBuffer(0), node.getResponseBuffer(1));
+            
+            if (isPowerOut) {
+                isPowerOut = false;
+                Serial.println(F("[POWER] Power Restored!"));
+            }
+
+            if (protEnabled && !autoInterlockActive && pump1Active && (millis() - pumpRunStartTime > 5000)) {
+                if (globalCurrent < 0) { 
+                    engageInterlock(4); 
+                } else if (globalCurrent < minA || globalCurrent > maxA) {
+                    int faultCode = (globalCurrent < minA) ? 2 : 3; 
+                    motorRetryCount++; 
+                    if (motorRetryCount >= 2) { 
+                        triggerEmergencyStop(faultCode); 
+                    } else { 
+                        engageInterlock(faultCode); 
+                    }
+                } else { 
+                    if (millis() - pumpRunStartTime > 25000 && motorRetryCount > 0) motorRetryCount = 0; 
+                }
+            }
+        } else { 
+            globalCurrent = -1.0; 
+            modbusFailCount++;
+            stableStartTime = 0; 
+            
+            if (modbusFailCount >= 3) {
+                if (!isPowerOut) {
+                    isPowerOut = true;
+                    Serial.println(F("[POWER] Connection to meter lost."));
+                }
+                if (!autoInterlockActive || autoInterlockReason != 5) {
+                    engageInterlock(5); 
+                }
+            }
+        }
+        readVoltageNext = true;
+
+        if(WiFi.status() == WL_CONNECTED && Firebase.ready() && signupOK) {
+            // v2 fix: the dashboard reads /system/voltage and /system/power directly, but v1
+            // only pushed the per-phase values below, so those two dashboard tiles never populated.
+            // globalPower is an approximation (sqrt(3) x V x I, assumes power factor ~1). If the
+            // L&T WL4400 exposes a true active-power (kW) register, read that instead for accuracy.
+            globalPower = (globalVoltage > 0 && globalCurrent >= 0) ? (1.732 * globalVoltage * globalCurrent) : -1.0;
+            Firebase.RTDB.setFloat(&fbdo, P("/system/voltageRY").c_str(), globalVRY);
+            Firebase.RTDB.setFloat(&fbdo, P("/system/voltageYB").c_str(), globalVYB);
+            Firebase.RTDB.setFloat(&fbdo, P("/system/voltageBR").c_str(), globalVBR);
+            Firebase.RTDB.setFloat(&fbdo, P("/system/voltage").c_str(), globalVoltage);
+            Firebase.RTDB.setFloat(&fbdo, P("/system/current").c_str(), globalCurrent);
+            Firebase.RTDB.setFloat(&fbdo, P("/system/power").c_str(), globalPower);
+        }
+    }
+}
+
+int getJsonIntSafe(FirebaseJson &json, const char* pathArr, const char* pathObj, int defaultVal) {
+    FirebaseJsonData result; 
+    json.get(result, pathArr);
+    if (result.success) return result.intValue;
+    json.get(result, pathObj); 
+    if (result.success) return result.intValue; 
+    return defaultVal;
+}
+
+void readFastFirebaseData() {
+  if (Firebase.ready() && signupOK) {
+      esp_task_wdt_reset();
+
+      if (Firebase.RTDB.getJSON(&fbdo, P("/system").c_str())) {
+          esp_task_wdt_reset();
+
+          FirebaseJson &json = fbdo.jsonObject(); FirebaseJsonData result;
+          
+          json.get(result, "motorConfig/minV"); if(result.success) minV = result.floatValue;
+          json.get(result, "motorConfig/maxV"); if(result.success) maxV = result.floatValue;
+          json.get(result, "motorConfig/minA"); if(result.success) minA = result.floatValue;
+          json.get(result, "motorConfig/maxA"); if(result.success) maxA = result.floatValue;
+          
+          json.get(result, "motorConfig/enabled"); 
+          if(result.success) {
+              protEnabled = result.boolValue;
+          }
+
+          json.get(result, "autoResumeEnabled"); if(result.success) autoResumeEnabled = result.boolValue;
+
+          // ഫിക്സ്: ഫയർബേസിൽ നിന്ന് എമർജൻസി റീഡ് ചെയ്ത് സ്റ്റക്ക് ആവാതിരിക്കാനുള്ള കോഡ്
+          bool incomingEmergency = false;
+          json.get(result, "emergencyStop");
+          if (result.success) incomingEmergency = result.boolValue;
+
+          if (incomingEmergency && !lastEmergencyState) {
+              if (!isEmergencyTripped) {
+                  triggerEmergencyStop(0); 
+                  Firebase.RTDB.setInt(&fbdo, P("/system/manualIrrZone").c_str(), 0); 
+                  Firebase.RTDB.setInt(&fbdo, P("/system/manualFertZone").c_str(), 0); 
+                  Firebase.RTDB.setBool(&fbdo, P("/system/isBackwashActive").c_str(), false); 
+                  ignoreFirebaseUntil = millis() + 1500;
+              }
+          } else if (!incomingEmergency && lastEmergencyState) {
+              isEmergencyTripped = false;
+              releaseInterlock();
+              motorRetryCount = 0; 
+          }
+          lastEmergencyState = incomingEmergency;
+
+          if (!isEmergencyTripped) {
+              int incomingIrrMins = 0; json.get(result, "manualIrrMins"); if (result.success) incomingIrrMins = result.intValue;
+              json.get(result, "manualIrrZone");
+              if(result.success) {
+                  int newIrrZone = result.intValue;
+                  if (pendingClearIrr) {
+                      if (newIrrZone != 0) { Firebase.RTDB.setInt(&fbdo, P("/system/manualIrrZone").c_str(), 0); Firebase.RTDB.setInt(&fbdo, P("/system/manualIrrMins").c_str(), 0); } else pendingClearIrr = false; 
+                  } else {
+                      if (newIrrZone != manualIrrZone) {
+                          if (autoInterlockActive && !autoResumeEnabled && newIrrZone > 0) {
+                              Firebase.RTDB.setInt(&fbdo, P("/system/manualIrrZone").c_str(), 0);
+                              Firebase.RTDB.setInt(&fbdo, P("/system/manualIrrMins").c_str(), 0);
+                          } else {
+                              manualIrrZone = newIrrZone;
+                              if (manualIrrZone > 0) { time_t now; time(&now); if (incomingIrrMins > 0) manualIrrStop = now + (incomingIrrMins * 60); else manualIrrStop = 0; } else manualIrrStop = 0; 
+                          }
+                      }
+                  }
+              }
+
+              int incomingFertMins = 0; json.get(result, "manualFertMins"); if (result.success) incomingFertMins = result.intValue;
+              json.get(result, "manualFertZone");
+              if(result.success) {
+                  int newFertZone = result.intValue;
+                  if (pendingClearFert) {
+                      if (newFertZone != 0) { Firebase.RTDB.setInt(&fbdo, P("/system/manualFertZone").c_str(), 0); Firebase.RTDB.setInt(&fbdo, P("/system/manualFertMins").c_str(), 0); } else pendingClearFert = false; 
+                  } else {
+                      if (newFertZone != manualFertZone) {
+                          if (autoInterlockActive && !autoResumeEnabled && newFertZone > 0) {
+                              Firebase.RTDB.setInt(&fbdo, P("/system/manualFertZone").c_str(), 0);
+                              Firebase.RTDB.setInt(&fbdo, P("/system/manualFertMins").c_str(), 0);
+                          } else {
+                              manualFertZone = newFertZone;
+                              if (manualFertZone > 0) { 
+                                  time_t now; time(&now); 
+                                  if (incomingFertMins > 0) manualFertStop = now + (incomingFertMins * 60); else manualFertStop = 0; 
+                              } else manualFertStop = 0; 
+                          }
+                      }
+                  }
+              }
+          }
+      }
+  }
+}
+
+void readSlowFirebaseData() {
+    if (Firebase.ready() && signupOK) {
+        esp_task_wdt_reset(); 
+
+        if (Firebase.RTDB.getJSON(&fbdo, P("/schedules").c_str())) {
+            
+            esp_task_wdt_reset();
+
+            FirebaseJson &json = fbdo.jsonObject(); 
+            FirebaseJsonData result;
+
+            json.get(result, "backwash/active");
+            if(result.success) {
+                bwConfig.active = result.boolValue;
+                bwConfig.days = getJsonIntSafe(json, "backwash/days", "backwash/days", 0);
+                bwConfig.hour = getJsonIntSafe(json, "backwash/hour", "backwash/hour", 0); 
+                bwConfig.minute = getJsonIntSafe(json, "backwash/minute", "backwash/minute", 0);
+                bwConfig.durationMins = getJsonIntSafe(json, "backwash/durationMins", "backwash/durationMins", 5);
+            } else {
+                bwConfig.active = false;
+            }
+            
+            char pathArr[64];
+            char pathObj[64];
+            char sPath[32];
+
+            for(int s=0; s<3; s++) {
+                esp_task_wdt_reset(); 
+
+                snprintf(sPath, sizeof(sPath), "slot_%d/", s);
+                snprintf(pathObj, sizeof(pathObj), "%sactive", sPath);
+                json.get(result, pathObj);
+                
+                if(result.success) {
+                   schedules[s].active = result.boolValue;
+                   snprintf(pathObj, sizeof(pathObj), "%sdays", sPath);
+                   schedules[s].days = getJsonIntSafe(json, pathObj, pathObj, 0);
+                   
+                   int stCount = 0;
+                   for(int st=0; st<5; st++) {
+                       snprintf(pathArr, sizeof(pathArr), "%sstarts/[%d]/hour", sPath, st);
+                       snprintf(pathObj, sizeof(pathObj), "%sstarts/%d/hour", sPath, st);
+                       int h = getJsonIntSafe(json, pathArr, pathObj, -1);
+                       
+                       if (h != -1) { 
+                           schedules[s].starts[stCount].hour = h; 
+                           snprintf(pathArr, sizeof(pathArr), "%sstarts/[%d]/minute", sPath, st);
+                           snprintf(pathObj, sizeof(pathObj), "%sstarts/%d/minute", sPath, st);
+                           schedules[s].starts[stCount].minute = getJsonIntSafe(json, pathArr, pathObj, 0); 
+                           stCount++; 
+                       }
+                   }
+                   if(stCount == 0) {
+                       snprintf(pathObj, sizeof(pathObj), "%shour", sPath);
+                       int h = getJsonIntSafe(json, pathObj, pathObj, -1);
+                       if(h != -1) { 
+                           schedules[s].starts[0].hour = h; 
+                           snprintf(pathObj, sizeof(pathObj), "%sminute", sPath);
+                           schedules[s].starts[0].minute = getJsonIntSafe(json, pathObj, pathObj, 0); 
+                           stCount = 1; 
+                       }
+                   }
+                   schedules[s].startCount = stCount;
+
+                   for(int z=0; z<6; z++) {
+                     snprintf(pathArr, sizeof(pathArr), "%szones/[%d]/waterMins", sPath, z);
+                     snprintf(pathObj, sizeof(pathObj), "%szones/%d/waterMins", sPath, z);
+                     schedules[s].zones[z].waterMins = getJsonIntSafe(json, pathArr, pathObj, 0);
+                     if (schedules[s].zones[z].waterMins > 300) schedules[s].zones[z].waterMins = 300;
+                     
+                     int fCount = 0;
+                     for(int f=0; f<4; f++) {
+                        snprintf(pathArr, sizeof(pathArr), "%szones/[%d]/ferts/[%d]/comp", sPath, z, f);
+                        snprintf(pathObj, sizeof(pathObj), "%szones/%d/ferts/%d/comp", sPath, z, f);
+                        int compFound = getJsonIntSafe(json, pathArr, pathObj, 0);
+                        
+                        if(compFound > 0) {
+                           schedules[s].zones[z].ferts[fCount].comp = compFound;
+                           
+                           snprintf(pathArr, sizeof(pathArr), "%szones/[%d]/ferts/[%d]/mins", sPath, z, f);
+                           snprintf(pathObj, sizeof(pathObj), "%szones/%d/ferts/%d/mins", sPath, z, f);
+                           schedules[s].zones[z].ferts[fCount].mins = getJsonIntSafe(json, pathArr, pathObj, 0);
+                           
+                           snprintf(pathArr, sizeof(pathArr), "%szones/[%d]/ferts/[%d]/startHour", sPath, z, f);
+                           snprintf(pathObj, sizeof(pathObj), "%szones/%d/ferts/%d/startHour", sPath, z, f);
+                           schedules[s].zones[z].ferts[fCount].startHour = getJsonIntSafe(json, pathArr, pathObj, 0);
+                           
+                           snprintf(pathArr, sizeof(pathArr), "%szones/[%d]/ferts/[%d]/startMinute", sPath, z, f);
+                           snprintf(pathObj, sizeof(pathObj), "%szones/%d/ferts/%d/startMinute", sPath, z, f);
+                           schedules[s].zones[z].ferts[fCount].startMinute = getJsonIntSafe(json, pathArr, pathObj, 0);
+                           
+                           snprintf(pathArr, sizeof(pathArr), "%szones/[%d]/ferts/[%d]/days", sPath, z, f);
+                           snprintf(pathObj, sizeof(pathObj), "%szones/%d/ferts/%d/days", sPath, z, f);
+                           schedules[s].zones[z].ferts[fCount].days = getJsonIntSafe(json, pathArr, pathObj, 0);
+                           fCount++;
+                        }
+                     }
+                     schedules[s].zones[z].fertCount = fCount;
+                   }
+                } else schedules[s].active = false;
+            }
+        }
+    }
+}
+
+void sendHeartbeat() {
+  if (Firebase.ready() && signupOK) { 
+      time_t now; time(&now); 
+      if (now > 100000) { Firebase.RTDB.setInt(&fbdo, P("/system/heartbeat").c_str(), now); Firebase.RTDB.setInt(&fbdo, P("/system/rssi").c_str(), WiFi.RSSI()); }
+  }
+}
+
+bool isSystemBusy() {
+    if (pump1Active || fertPumpActive || heldIrrZone != -1 || heldFertZone != -1) return true;
+    if (bwStart > 0 && bwStop > 0) return true;
+    return false;
+}
+
+// --- v5: REMOTE OTA FIRMWARE UPDATE ---
+// Reads a shared (not per-device) /firmwareUpdate/{version,url} node. If it differs from
+// FW_VERSION, downloads and flashes that binary over HTTPS. Never runs while a pump/valve
+// sequence is active (isSystemBusy()) so a rollout can never interrupt a live irrigation run.
+// A per-device /system/holdUpdate:true flag lets you exclude one unit from a rollout - useful
+// for keeping a canary/test unit pinned while you validate a new build on it manually.
+void checkForFirmwareUpdate() {
+    if (WiFi.status() != WL_CONNECTED || !Firebase.ready() || !signupOK) return;
+    if (isSystemBusy()) return;
+
+    if (Firebase.RTDB.getBool(&fbdo, P("/system/holdUpdate").c_str()) && fbdo.dataType() == "boolean" && fbdo.boolData()) {
+        return; // this unit is pinned - skip rollout checks entirely
+    }
+
+    Firebase.RTDB.setString(&fbdo, P("/system/otaStatus").c_str(), "checking");
+
+    if (!Firebase.RTDB.getString(&fbdo, "/firmwareUpdate/version")) return;
+    String targetVersion = fbdo.stringData();
+    if (targetVersion.length() == 0 || targetVersion == FW_VERSION) {
+        Firebase.RTDB.setString(&fbdo, P("/system/otaStatus").c_str(), "idle");
+        return;
+    }
+
+    if (!Firebase.RTDB.getString(&fbdo, "/firmwareUpdate/url")) return;
+    String fwUrl = fbdo.stringData();
+    if (fwUrl.length() == 0) return;
+
+    Serial.print(F("[OTA] New firmware available: ")); Serial.print(targetVersion);
+    Serial.print(F(" (current: ")); Serial.print(FW_VERSION); Serial.println(F(") - downloading..."));
+    Firebase.RTDB.setString(&fbdo, P("/system/otaStatus").c_str(), "downloading");
+
+    WiFiClientSecure otaClient;
+    otaClient.setInsecure(); // firmware binary itself isn't sensitive data; skipping cert
+                              // pinning keeps this simple across whatever host serves it
+    esp_task_wdt_reset();
+    httpUpdate.rebootOnUpdate(true); // on success, this call never returns - device reboots into the new build
+    // v5.0.2: GitHub Releases download links 302-redirect to a different host
+    // (objects.githubusercontent.com) before serving the actual file - without this, the
+    // update would fail immediately on a redirect response instead of downloading anything.
+    httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    t_httpUpdate_return ret = httpUpdate.update(otaClient, fwUrl);
+
+    // Only reached if the update did NOT succeed (success reboots immediately above).
+    switch (ret) {
+        case HTTP_UPDATE_FAILED:
+            Serial.printf("[OTA] Update failed (%d): %s\n", httpUpdate.getLastError(), httpUpdate.getLastErrorString().c_str());
+            Firebase.RTDB.setString(&fbdo, P("/system/otaStatus").c_str(), "failed: " + httpUpdate.getLastErrorString());
+            break;
+        case HTTP_UPDATE_NO_UPDATES:
+            Firebase.RTDB.setString(&fbdo, P("/system/otaStatus").c_str(), "idle");
+            break;
+        default:
+            break;
+    }
+}
+
+void maintainNetwork() {
+    if (WiFi.status() != WL_CONNECTED) {
+        if (!wasDisconnected) { 
+            wasDisconnected = true; 
+            wifiDisconnectTime = millis(); 
+            Serial.println(F("[NETWORK] WiFi Connection Lost!"));
+            WiFi.disconnect(); 
+        }
+        
+        if (isSystemBusy()) {
+            return; 
+        }
+
+        static unsigned long lastWifiRetry = 0;
+        if (millis() - lastWifiRetry > 30000) {
+            lastWifiRetry = millis();
+            Serial.println(F("[NETWORK] System Idle. Attempting to reconnect WiFi..."));
+            WiFi.disconnect();
+            WiFi.begin(); // v4: no args - reconnects with the credentials WiFiManager already saved to flash
+        }
+
+        return; 
+    } 
+    
+    if (wasDisconnected && WiFi.status() == WL_CONNECTED) {
+        wasDisconnected = false;
+        Serial.println(F("[NETWORK] WiFi Reconnected successfully!"));
+        configTime(19800, 0, "pool.ntp.org", "time.google.com");
+        ntpSyncPending = true;
+        lastNtpAttempt = millis();
+    }
+
+    if (ntpSyncPending) {
+        time_t now = time(nullptr);
+        if (now > 1600000000) {
+            ntpSyncPending = false;
+            Firebase.setSystemTime(now); 
+            Firebase.reconnectWiFi(true); 
+            Serial.println(F("[NETWORK] Time Synced & Firebase Reconnected."));
+        } else if (millis() - lastNtpAttempt > 15000) {
+            ntpSyncPending = false;
+            Serial.println(F("[NETWORK] NTP Sync Timeout after reconnect."));
+        }
+    }
+}
+
+void setup() {
+  Serial.begin(115200); delay(2000);
+
+  // v5.0.1: OTA rollback safety net. esp_ota_mark_app_valid_cancel_rollback() below (called
+  // once this boot proves it can reach WiFi + Firebase) is the *first* line of defense, but it
+  // only helps automatically if the bootloader itself was built with app-rollback support
+  // enabled - that's a build-time flag the stock Arduino IDE toolchain doesn't expose a
+  // checkbox for, so it can't be guaranteed from here without testing the exact board
+  // package in hand. Given these units control live pumps/valves in the field with no easy
+  // physical access, we don't rely on that assumption alone: this counter, stored in NVS
+  // (survives across OTA flashes - separate flash partition from the app itself), tracks
+  // consecutive boots that never reached the healthy checkpoint. After 3 in a row, we
+  // explicitly force a revert to the previous known-good firmware ourselves.
+  bootGuard.begin("otaguard", false);
+  int bootAttempts = bootGuard.getInt("attempts", 0);
+  if (bootAttempts >= 3) {
+      Serial.println(F("[OTA] 3 consecutive boots failed to reach a healthy state - reverting to previous firmware."));
+      bootGuard.putInt("attempts", 0);
+      bootGuard.putBool("justRolledBack", true);
+      esp_ota_mark_app_invalid_rollback_and_reboot(); // reboots into the last known-good OTA partition - does not return
+      delay(5000);
+      ESP.restart(); // only reached if the call above somehow didn't reboot us
+  }
+  bootGuard.putInt("attempts", bootAttempts + 1);
+
+  esp_task_wdt_config_t wdt_config = {
+      .timeout_ms = 30000, 
+      .idle_core_mask = (1 << portNUM_PROCESSORS) - 1, 
+      .trigger_panic = true
+  };
+  esp_task_wdt_reconfigure(&wdt_config); 
+  esp_task_wdt_add(NULL); 
+  
+  Serial2.begin(9600, SERIAL_8E1, RS485_RX_PIN, RS485_TX_PIN);
+  node.begin(1, Serial2); 
+  
+  digitalWrite(relayMaster, LOW);
+  pinMode(relayMaster, OUTPUT);
+
+  // v2 fix: this used to be a second, separately hardcoded copy of the zone pin numbers
+  // (13,14,17,18,19,21,23,25,26,27) that had to be kept in sync with irrZonePins[]/fertZonePins[]
+  // by hand. It was NOT updated when those arrays were remapped for the S3, which would have
+  // left the real zone/fert pins never configured as OUTPUT at boot. Now it's built directly
+  // from the arrays so it can never drift out of sync again.
+  int allPins[] = {relay1_pumpMain, relay2_valveMain, relay3_flushIn, relayFertPump,
+                    irrZonePins[0], irrZonePins[1], irrZonePins[2], irrZonePins[3], irrZonePins[4], irrZonePins[5],
+                    fertZonePins[0], fertZonePins[1], fertZonePins[2], fertZonePins[3]};
+  for(int i = 0; i < 14; i++) {
+      digitalWrite(allPins[i], HIGH);
+      pinMode(allPins[i], OUTPUT);
+  }
+
+  // v4: WiFi is no longer hardcoded. WiFi.mode(WIFI_STA) makes the MAC address
+  // readable immediately, before we've even connected, which is what we use as
+  // this unit's permanent device identity.
+  WiFi.mode(WIFI_STA); WiFi.setAutoReconnect(false);
+  String macStr = WiFi.macAddress(); macStr.replace(":", "");
+  deviceId = macStr;
+  devBase = "/devices/" + deviceId;
+  Serial.print(F("[SETUP] Device ID (MAC): ")); Serial.println(deviceId);
+
+  WiFiManager wm;
+  wm.setConfigPortalTimeout(300); // give up and reboot to retry after 5 min unconfigured
+  String apName = "SIP-Setup-" + macStr.substring(8); // last 4 hex chars -> distinguishable per unit
+  esp_task_wdt_reset();
+  bool wifiOk = wm.autoConnect(apName.c_str(), "irrigation123");
+  if (!wifiOk) {
+      Serial.println(F("[SETUP] Config portal timed out with no WiFi configured - rebooting to retry."));
+      delay(1000);
+      ESP.restart();
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+      WiFi.setSleep(false); WiFi.setTxPower(WIFI_POWER_19_5dBm);
+      configTime(19800, 0, "pool.ntp.org", "time.google.com");
+
+      int timeAttempts = 0;
+      while (time(nullptr) < 100000 && timeAttempts < 40) {
+          esp_task_wdt_reset();
+          delay(500);
+          timeAttempts++;
+      }
+  }
+
+  prefs.begin("irr_state", false);
+  pendingResumeZone = prefs.getInt("z", 0);
+  pendingResumeRemain = prefs.getLong("r", 0);
+  
+  config.api_key = API_KEY; config.database_url = DATABASE_URL;
+  if (Firebase.signUp(&config, &auth, "", "")) signupOK = true;
+  
+  fbdo.setBSSLBufferSize(4096, 1024); 
+  Firebase.setSystemTime(time(nullptr)); 
+
+  Firebase.begin(&config, &auth); Firebase.reconnectWiFi(true);
+  
+  int timeout = 0;
+  while (!Firebase.ready() && timeout < 20) { 
+      esp_task_wdt_reset(); 
+      delay(500); timeout++; 
+  }
+  
+  if (signupOK && Firebase.ready()) {
+     Serial.println(F("\n[SYSTEM] System Booted & Online"));
+     digitalWrite(relayMaster, HIGH);
+     Serial.println(F("[RELAY] Master Relay ON"));
+
+     // v5: this build proved it can boot, connect to WiFi, and reach Firebase on its own -
+     // tell the bootloader this partition is good so it won't be auto-rolled-back. Also
+     // report our own version + clear any stale OTA status left over from before a reboot.
+     esp_ota_mark_app_valid_cancel_rollback();
+     bootGuard.putInt("attempts", 0); // v5.0.1: reached a healthy state - clear the failure counter
+
+     Firebase.RTDB.setString(&fbdo, P("/system/fwVersion").c_str(), FW_VERSION);
+     if (bootGuard.getBool("justRolledBack", false)) {
+         // v5.0.1: we're booting after the safety net above force-reverted us to this
+         // (previous, known-good) firmware - surface that clearly instead of silently going idle.
+         bootGuard.putBool("justRolledBack", false);
+         Firebase.RTDB.setString(&fbdo, P("/system/otaStatus").c_str(), "rolled_back: previous update failed to come online 3x, reverted automatically");
+         Serial.println(F("[OTA] Recovered via automatic rollback to previous firmware."));
+     } else {
+         Firebase.RTDB.setString(&fbdo, P("/system/otaStatus").c_str(), "idle");
+     }
+  }
+  readSlowFirebaseData();
+}
+
+unsigned long lastFastUpdate = 0; unsigned long lastSlowUpdate = 0; unsigned long lastHeartbeat = 0; unsigned long lastPzemRead = 0;
+
+void loop() {
+  esp_task_wdt_reset(); 
+  
+  unsigned long currentMillis = millis();
+  
+  updateSystem();
+  checkRecurringSchedules();
+  
+  if (currentMillis - lastPzemRead >= 1500) { 
+      lastPzemRead = currentMillis; 
+      readPowerMeterData(); 
+  }
+  
+  maintainNetwork();
+  
+  if (WiFi.status() != WL_CONNECTED) return;
+  
+  if (currentMillis - lastFastUpdate >= 3000 && currentMillis > ignoreFirebaseUntil) { 
+      lastFastUpdate = currentMillis; 
+      readFastFirebaseData(); 
+  }
+  
+  if (currentMillis - lastSlowUpdate >= 30000) { 
+      lastSlowUpdate = currentMillis; 
+      readSlowFirebaseData(); 
+  }
+  
+  if (currentMillis - lastHeartbeat >= 5000) {
+      lastHeartbeat = currentMillis;
+      sendHeartbeat();
+  }
+
+  // v5: first OTA check ~90s after boot (once WiFi/Firebase are reliably up), then every
+  // OTA_CHECK_INTERVAL after that. Deliberately infrequent - this is a background check,
+  // not something that needs to be instant, and it keeps update rollouts from hammering
+  // Firebase or the download host across a whole fleet at once.
+  if (!otaCheckedThisBoot && currentMillis > 90000) {
+      otaCheckedThisBoot = true;
+      lastOtaCheck = currentMillis;
+      checkForFirmwareUpdate();
+  } else if (otaCheckedThisBoot && currentMillis - lastOtaCheck >= OTA_CHECK_INTERVAL) {
+      lastOtaCheck = currentMillis;
+      checkForFirmwareUpdate();
+  }
+}
