@@ -1,0 +1,1584 @@
+#include <WiFi.h>
+#include <WiFiManager.h> // https://github.com/tzapu/WiFiManager - install via Library Manager
+#include <HTTPUpdate.h>       // v6.1.0: GitHub-Releases-based OTA update check - see checkForFirmwareUpdate()
+#include <WiFiClientSecure.h> // v6.1.0: needed for the HTTPS connection to github.com / raw.githubusercontent.com
+#include <ArduinoJson.h>
+#include <Firebase_ESP_Client.h>
+#include "time.h"
+#include <ModbusMaster.h>
+#include <Preferences.h>
+#include <esp_task_wdt.h> // വാച്ച്ഡോഗ് ടൈമർ
+#include "esp_ota_ops.h"    // v5: esp_ota_mark_app_valid_cancel_rollback()
+#include "esp_mac.h"        // v5.0.3: esp_read_mac() - reads the factory MAC directly from eFuse
+#include <Wire.h>
+#include <Adafruit_MCP23X17.h> // v5.1.0: MCP23017 I2C IO expander - install "Adafruit MCP23017 Arduino
+                                // Library" via Library Manager (pulls in Adafruit BusIO as a dependency)
+
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+// ============================================================================
+// SIP CONTROLLER FIRMWARE - v2 (ESP32-S3 compatible)
+// Changes from v1:
+//   1. Relay/valve GPIOs remapped below. The v1 pin set used GPIO22, 23, 25
+//      (these numbers don't exist on ESP32-S3) and GPIO26, 27, 32, 33
+//      (reserved for the chip's internal SPI flash/PSRAM on ESP32-S3).
+//      GPIO19 was also dropped (shared with native USB D- on S3).
+//      Rewire your relay/valve harness to match the HARDWARE PINS block
+//      below. This map is also still 100% valid on a classic ESP32.
+//   2. Firebase now also pushes /system/voltage and /system/power. The web
+//      dashboard reads those two paths, but v1 firmware never wrote them
+//      (only the per-phase voltageRY/YB/BR + current were sent), so the
+//      dashboard's Voltage/Power tiles were permanently stuck on
+//      "SENSOR ERROR" / blank even with a healthy meter.
+//   3. Added an esp_task_wdt_reset() before the batch of Firebase telemetry
+//      writes in updateSystem(), as a safety margin against a watchdog
+//      reset if the network is slow during that write burst.
+//
+// v3 adds one more fix on top of the above:
+//   4. Water-hammer guard for the irrigation<->backwash handoff. If a backwash
+//      schedule collides with a running zone, the main valve used to slam shut
+//      and the flush valve snap open in the same tick while the pump kept
+//      running through the switch. Now a direct crossover between those two
+//      active flow paths forces the pump off and re-runs the normal 3s startup
+//      debounce, so the valves finish settling before the pump pushes flow
+//      into the new path again. See "v3 fix" comment in updateSystem().
+// No other scheduling, interlock, or safety-trip logic was changed.
+//
+// v4 makes this a multi-customer-ready build:
+//   5. WiFi credentials are no longer hardcoded. On first boot (or whenever
+//      saved WiFi fails to connect) the board opens its own "SIP-Setup-XXXX"
+//      access point with a captive portal - connect a phone to it and enter
+//      the customer's WiFi SSID/password there. Saved to flash via
+//      WiFiManager; the same compiled binary now works at every site.
+//   6. Every unit now identifies itself by its own factory-unique MAC address
+//      (read once at boot, no typing/labels needed) and all Firebase RTDB
+//      paths are namespaced under /devices/{mac}/... instead of a shared
+//      /system and /schedules root. This is what makes it safe to point many
+//      customers' units at the same Firebase project - see the deviceId /
+//      devBase / P() helper below, and the SIP-Controller-Multi-Tenant-Setup
+//      note saved to the project for the Firebase-side half of this (Auth
+//      accounts, /deviceOwners mapping, and Security Rules).
+//
+// v5 adds remote OTA (over-the-air) firmware updates:
+//   7. Every unit now reports its own compiled FW_VERSION to Firebase
+//      (/system/fwVersion), so the customer and admin dashboards can both
+//      show what firmware a device is actually running.
+//   8. checkForFirmwareUpdate() periodically compares FW_VERSION against a
+//      shared /firmwareUpdate/version + /firmwareUpdate/url published from
+//      the Firebase Console, and if they differ, downloads and flashes the
+//      new binary over HTTPS - no physical access to the unit required.
+//      It refuses to start while isSystemBusy() is true (an active
+//      irrigation/fert run), and a per-device /system/holdUpdate flag lets
+//      you exclude a specific unit from a rollout (for staged testing).
+//      /system/otaStatus reports progress (idle/checking/downloading/
+//      failed:.../success) so you can watch a rollout from the admin console.
+//   9. esp_ota_mark_app_valid_cancel_rollback() is called once a freshly
+//      flashed build proves it can reach WiFi + Firebase on its own, which
+//      is what tells the ESP32's dual-OTA-partition scheme this build is
+//      good. See "SIP-Controller-Multi-Tenant-Setup" project doc, "Remote
+//      Firmware Updates (OTA)" section, for the full publish procedure and
+//      the honest limits of remote recovery if a bad build can't get online
+//      at all.
+//   10. (v5.0.1) The bootloader's own automatic rollback-on-failed-boot isn't
+//       something we can guarantee is enabled from the stock Arduino IDE
+//       build, so we don't rely on it alone. An explicit NVS-backed boot
+//       counter now force-reverts to the previous firmware itself after 3
+//       consecutive boots that never reach the "WiFi + Firebase confirmed
+//       healthy" checkpoint - see bootGuard in setup().
+//   11. (v5.0.2) httpUpdate now follows HTTP redirects, needed for hosting the
+//       .bin on GitHub Releases (its download links redirect to
+//       objects.githubusercontent.com rather than serving the file directly).
+//   12. (v5.0.3) Device identity now reads the MAC via esp_read_mac() straight
+//       from eFuse instead of WiFi.macAddress(). On this board/core combo,
+//       WiFi.macAddress() was returning all-zeros because it depends on the
+//       WiFi driver already being fully initialized, which isn't guaranteed
+//       immediately after WiFi.mode(WIFI_STA) on this core version.
+//       esp_read_mac() has no such dependency - it's available from the
+//       instant the chip powers on.
+//   13. (v5.0.4) TEMPORARY: WiFiManager's autoConnect()/startConfigPortal() is
+//       hitting a confirmed upstream bug (tzapu/WiFiManager#1797 - broken on
+//       arduino-esp32 core 3.1.0+, no fix yet). Bypassed entirely for now with
+//       hardcoded WiFi credentials (wifiSSID/wifiPass globals) so bench testing
+//       can continue while the core gets downgraded to 3.0.7. MUST be reverted
+//       to WiFiManager before any real customer deployment - hardcoded
+//       credentials break the zero-touch multi-tenant provisioning this
+//       project is built around.
+//   14. (v5.0.5) TEMPORARY: remote OTA update code (checkForFirmwareUpdate(),
+//       HTTPUpdate/WiFiClientSecure, the otaCheckedThisBoot/OTA_CHECK_INTERVAL
+//       state, and its call in loop()) removed for now while bench-debugging
+//       the boot sequence - fewer moving parts while chasing crashes. The
+//       NVS bootGuard rollback safety net (item 10) and
+//       esp_ota_mark_app_valid_cancel_rollback() are UNRELATED to this and
+//       were kept - they protect against a bad manual flash too, not just
+//       remote updates. Re-add checkForFirmwareUpdate() from an earlier
+//       version of this file once bench testing is done.
+//   15. (v5.0.6) Fixes both a task watchdog timeout crash AND the
+//       "esp_task_wdt_reset(707): task not found" errors introduced trying to
+//       fix it in v5.0.5. Root cause of the original crash (~43s after boot,
+//       inside loopTask): Firebase.signUp()/Firebase.begin() in setup() are
+//       blocking network/TLS calls with no internal watchdog pets, so a slow
+//       signup call alone could exceed the 30s budget and panic. v5.0.5 tried
+//       fixing this by delaying esp_task_wdt_add(NULL) until the end of
+//       setup() - but the WiFi-connect and NTP-wait loops earlier in setup()
+//       both call esp_task_wdt_reset() every pass, and reset() on a task
+//       that was never add()'ed yet just errors instead of doing anything -
+//       hence the "task not found" spam. Correct fix: add() the task
+//       immediately again (like pre-v5.0.5), but start the watchdog's
+//       timeout_ms at 60000 instead of 30000 to give Firebase.signUp()/begin()
+//       real headroom, then reconfigure it back down to 30000 right before
+//       setup() returns, so loop() (which pets it every iteration) still gets
+//       caught fast if anything ever actually hangs.
+//   16. (v5.0.7) Added Serial progress output around the NTP sync loop,
+//       Firebase.signUp(), and the Firebase.ready() wait loop in setup() -
+//       all three were completely silent before, so a hang or a slow/failed
+//       network call anywhere in that stretch looked identical to a device
+//       that had crashed ("nothing happens" on the Serial Monitor). Now each
+//       one prints progress dots and OK/FAILED so a stuck boot points
+//       straight at which specific step it's stuck on.
+//   17. (v5.0.8) Firebase.begin() is now only called if Firebase.signUp()
+//       actually succeeded. It used to run unconditionally, so a failed
+//       anonymous sign-up (e.g. Anonymous auth not enabled yet in Firebase
+//       Console -> Authentication -> Sign-in method) still fed no valid
+//       credentials into Firebase.begin(), which then hung well past the 60s
+//       setup watchdog budget instead of failing fast - causing a task
+//       watchdog crash ~95s into boot. Now a failed sign-up just skips
+//       Firebase for that boot (device still runs relays/schedules locally,
+//       no cloud sync until the next successful boot) instead of crashing.
+//   18. (v5.0.9) Fixed: "Lost Modbus communication with the power meter" /
+//       hardware-lock (interlock reason 5) was firing and staying locked
+//       even with the hardware protection toggle (protEnabled) turned OFF.
+//       Every other trip condition in readPowerMeterData() (phase lost,
+//       out-of-range voltage/current, motor stall) already checked
+//       protEnabled first - the Modbus-connection-lost check was the one
+//       exception, triggering unconditionally. It's now gated behind
+//       protEnabled like the rest, AND the auto-release check at the top of
+//       readPowerMeterData() (which un-locks reasons 1-4 and 6 once
+//       protection is turned off) now also covers reason 5, so an
+//       already-tripped meter-lost lock clears too, not just future ones.
+//       This also means: with protection OFF, you can bench-test with no
+//       physical Modbus meter wired up at all and the pump/valve relays
+//       will no longer get locked out over it.
+//   19. (v5.0.10) Fixed: the dashboard could keep showing "PAUSED /
+//       Auto-recovery monitoring in progress" forever after a reboot, even
+//       though nothing tripped this boot and Serial showed no
+//       "[INTERLOCK] Hardware Paused!" line. Cause: autoInterlockActive
+//       always resets to false in RAM on every boot, but Firebase's
+//       /system/interlockReason was never explicitly re-synced to match -
+//       so a value from a PRIOR session (e.g. a lockout from before the
+//       v5.0.9 protEnabled fix existed) just sat there and the dashboard
+//       kept showing it as current. Now cleared to 0 as part of the normal
+//       healthy-boot Firebase writes, since fresh RAM state is authoritative
+//       right after a clean boot.
+//   20. (v5.1.0) ONLY the 6 irrigation zone valves moved off direct ESP32
+//       GPIOs onto a MCP23017 I2C IO expander (channels 0-5 used, 10 spare).
+//       Every other relay (main pump, main valve, flush valve, master relay,
+//       fert pump, 4 fert zones) stays a direct ESP32 GPIO, unchanged. This
+//       freed 6 ESP32 GPIOs (the old irrZonePins {13,14,17,18,6,21}); 2 of
+//       those are reused as the new I2C pins (13=SDA, 14=SCL) so no
+//       additional ESP32 pins were spent overall.
+//       irrZonePins[] now holds MCP23017 channel numbers (0-5), NOT ESP32
+//       GPIO numbers - do not confuse them with relay2_valveMain's GPIO 4 or
+//       any other direct-GPIO constant, the two numbering spaces overlap.
+//       A new controlIrrZoneRelay() function (mcp.digitalWrite()-based)
+//       drives only these 6 channels; the original controlRelay()
+//       (Arduino digitalWrite()-based) is unchanged and still drives every
+//       other relay exactly as before. See setup() for the MCP23017
+//       boot-time init and the safety notes there about preserving the
+//       "pre-load output value BEFORE switching to output mode" ordering
+//       that keeps valves from glitching open at boot - this matters just as
+//       much on the MCP23017 as it did on raw GPIO. controlIrrZoneRelay()
+//       fails safe (no I2C write) if the expander wasn't detected at boot.
+//   21. (v5.1.1) Fixed: MCP23017 not responding on I2C. MCP_I2C_ADDR was 0x20,
+//       assuming the bare-chip convention of A0/A1/A2 all tied to GND - but
+//       the actual hardware in use is a Waveshare MCP23017 IO Expansion
+//       Board, which sets its address via solder-bridge pads instead, and
+//       defaults to 0x27 when those pads are left unsoldered. Confirmed via
+//       a standalone I2C scanner sketch against the real board before
+//       changing this. Updated to 0x27 to match.
+//   22. (v6.0.0) REVERTED the v5.0.4 hardcoded-WiFi bypass. This build REQUIRES
+//       the ESP32 board package downgraded to arduino-esp32 core 3.0.7 in
+//       Boards Manager first - it will hit the same crash as before
+//       (tzapu/WiFiManager#1797) on core 3.1.0+. Once on 3.0.7, WiFiManager's
+//       autoConnect() runs again: each unit boots its own "SIP-Setup-XXXXXX"
+//       access point (last 6 hex chars of its MAC, so nearby units never
+//       collide) if it has no saved WiFi credentials yet or can't reconnect
+//       to the last saved network. The customer connects a phone to that AP,
+//       picks their real WiFi network from WiFiManager's captive portal, and
+//       those credentials are saved to flash for all future boots - no
+//       reflash per customer, no hardcoded network. This is the actual
+//       zero-touch multi-tenant provisioning flow the project is built
+//       around. wifiSSID/wifiPass are gone; nothing hardcoded remains.
+//       IMPORTANT companion fix: WiFiManager's captive-portal wait doesn't
+//       pet the task watchdog, and can legitimately block far longer than
+//       the old 60s setup-phase budget while waiting for a customer to
+//       configure WiFi - raised that budget to 240s (see setup()) to cover a
+//       full 180s portal timeout plus normal Firebase headroom; it still
+//       tightens back down to 30s right before loop() takes over, unchanged.
+//   23. (v6.1.0) Re-added GitHub-Releases-based OTA update checking, now that v6.0.0 has been
+//       bench-tested and flashed as the stable baseline. checkForFirmwareUpdate() runs from
+//       loop() every OTA_CHECK_INTERVAL_MS (6h), gated on isSystemBusy() so it never
+//       interrupts an active irrigation/fert/backwash cycle. It compares FW_VERSION against
+//       the contents of a small raw-text file (GITHUB_VERSION_URL) rather than calling
+//       api.github.com directly - the API requires a User-Agent header and is rate-limited,
+//       while raw.githubusercontent.com has neither concern for this use. If the version
+//       differs, it downloads and flashes GITHUB_BINARY_URL, which relies on GitHub's
+//       "/releases/latest/download/<name>" alias to always point at whatever release is
+//       currently marked "latest" - so this URL never needs to change, as long as every
+//       future release's binary asset is named exactly "firmware.bin" and "latest.txt" in the
+//       repo is updated to match FW_VERSION each time a release is published (see the
+//       step-by-step process for the exact sequence).
+//       IMPORTANT: this function adds NO new rollback logic - it doesn't need to. The NVS
+//       bootGuard safety net (item 10 / v5.0.1) already covers every image regardless of how
+//       it got onto the device, USB or OTA, and was already proven on real hardware via the
+//       Dummy-A/Dummy-B rollback test. If a pulled update never reaches the healthy
+//       checkpoint 3 boots in a row, that existing mechanism reverts to whatever firmware was
+//       running before the update automatically.
+//       BOOTSTRAP NOTE: v6.0.0 (currently flashed) has no OTA-check code at all, so it can
+//       never discover this version - or any future one - on its own. This version has to be
+//       flashed once via USB to become the new baseline; every release published AFTER that
+//       point updates automatically with no further USB flashing required.
+//       WATCHDOG NOTE: checkForFirmwareUpdate() runs from loop(), where the watchdog is only
+//       30s - a real download+flash can take longer than that and httpUpdate.update() doesn't
+//       pet the watchdog itself, so the budget is temporarily widened to 120s around just
+//       that call and restored to 30s afterward (same pattern as the WiFiManager portal wait
+//       in setup(), item 22).
+// ============================================================================
+
+#define API_KEY "AIzaSyB3d2TB8bKWys4KBQY5YXFFazah_hfr0JQ"
+#define DATABASE_URL "https://customer-base-de561-default-rtdb.firebaseio.com"
+#define FW_VERSION "6.1.0-ota-github" // v6.1.0: GitHub-Releases OTA update check re-added - see changelog item 23 and checkForFirmwareUpdate()
+
+// v6.1.0: GitHub-Releases-based OTA update check. See checkForFirmwareUpdate() for how these
+// are used. GITHUB_VERSION_URL must point at a small plain-text file in the repo containing
+// EXACTLY the FW_VERSION string of whatever is currently the latest release (update this file
+// by hand each time you publish a new release - see the step-by-step process). Comparing
+// against a tiny raw text file avoids needing api.github.com (which requires a User-Agent
+// header and is rate-limited) just to learn the latest version number.
+// GITHUB_BINARY_URL uses GitHub's "/releases/latest/download/<name>" alias, which always
+// redirects to whichever release is currently marked "latest" (not a pre-release/draft) - so
+// this URL never has to change as long as every real release's binary asset is named exactly
+// "firmware.bin".
+#define GITHUB_VERSION_URL "https://raw.githubusercontent.com/pumpcontrollerprod/firmware/main/latest.txt"
+#define GITHUB_BINARY_URL "https://github.com/pumpcontrollerprod/firmware/releases/latest/download/firmware.bin"
+#define OTA_CHECK_INTERVAL_MS (6UL * 60UL * 60UL * 1000UL) // check every 6 hours
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+bool signupOK = false;
+Preferences prefs;
+Preferences bootGuard; // v5.0.1: separate NVS namespace ("otaguard") for the OTA rollback safety net
+
+// --- v4: PER-DEVICE IDENTITY ---
+// deviceId is this unit's own WiFi MAC address (set in setup(), once WiFi is up).
+// devBase is the Firebase path prefix every RTDB call is routed through via P().
+// This is what keeps one customer's controller from reading/writing another's data.
+String deviceId = "";
+String devBase = "";
+String P(const char* suffix) { return devBase + suffix; } // e.g. P("/system/pump1Active") returns "/devices/AABBCCDDEEFF/system/pump1Active"
+
+// --- HARDWARE PINS (ESP32-S3 safe map - v2) ---
+// v5.1.0: ONLY the 6 irrigation zone valves moved to the MCP23017 IO expander below - every
+// other relay stays a direct ESP32 GPIO, unchanged from before.
+const int relay1_pumpMain = 1;      // was 32 (reserved for flash on S3)
+const int relay2_valveMain = 4;     // unchanged - safe on both ESP32 and S3
+const int relay3_flushIn = 2;       // was 33 (reserved for PSRAM on S3)
+const int relayMaster = 16;         // unchanged - safe on both ESP32 and S3
+const int relayFertPump = 7;        // was 22 (GPIO22-25 don't exist on S3)
+const int fertZonePins[4] = {8, 9, 10, 11}; // was {23, 25, 26, 27} (nonexistent/flash-reserved on S3)
+
+// --- IRRIGATION ZONE VALVES: MCP23017 I2C IO expander channels (v5.1.0) ---
+// These are MCP23017 channel numbers (0-15, GPA0-7/GPB0-7), NOT ESP32 GPIO numbers - do not
+// mix them up with the pins above. They used to be direct GPIO {13,14,17,18,6,21}; those 6
+// ESP32 pins are now free for other use (2 of them are reused below for I2C). RESET tied to
+// 3.3V (not left floating), INTA/INTB unused. controlIrrZoneRelay() (not the direct-GPIO
+// controlRelay()) drives these.
+const int irrZonePins[6] = {0, 1, 2, 3, 4, 5};
+// v5.1.1: 0x20 assumed A0/A1/A2 all tied to GND (bare-chip wiring convention), but the
+// Waveshare MCP23017 IO Expansion Board being used instead sets its address via solder-bridge
+// pads that default to UNSOLDERED = 0x27, not 0x20 - confirmed via I2C scanner against the
+// actual board. Address updated to match; no hardware change needed unless those pads get
+// soldered later, in which case update this to match whatever the scanner reports then too.
+#define MCP_I2C_ADDR 0x27
+#define MCP_SDA_PIN 13   // reused from the now-free old irrZonePins[0] GPIO - no new ESP32 pin spent
+#define MCP_SCL_PIN 14   // reused from the now-free old irrZonePins[1] GPIO
+Adafruit_MCP23X17 mcp;
+bool mcpReady = false;   // set true only if mcp.begin_I2C() succeeds in setup() - controlIrrZoneRelay()
+                         // fails safe (no-op, valve stays whatever it already was) if this is false,
+                         // rather than silently writing to an I2C bus with nothing listening on it.
+
+// --- MODBUS PINS (L&T WL4400) ---
+#define RS485_RX_PIN 15
+#define RS485_TX_PIN 5
+
+ModbusMaster node;
+
+// --- SYSTEM STATE VARIABLES ---
+int manualIrrZone = 0; int manualFertZone = 0;
+time_t manualIrrStop = 0; time_t manualFertStop = 0;
+unsigned long ignoreFirebaseUntil = 0;
+
+unsigned long wifiDisconnectTime = 0;
+bool wasDisconnected = false;
+bool ntpSyncPending = false;
+unsigned long lastNtpAttempt = 0;
+
+bool pendingClearIrr = false; bool pendingClearFert = false;
+int lastActiveIrrZone = -2; int lastActiveFertZone = -2;
+bool lastPump1Active = false; bool lastFertPumpActive = false;
+unsigned long lastPrefSave = 0;
+
+int pendingResumeZone = 0;
+long pendingResumeRemain = 0;
+bool autoResumeEnabled = false; 
+
+// --- BUNGEE OVERLAP VARIABLES ---
+int heldIrrZone = -1; 
+int heldFertZone = -1;
+
+// --- ADVANCED STRUCTURES ---
+struct FertConfig { int comp; int mins; uint8_t days; int startHour; int startMinute; };
+struct ZoneConfig { int waterMins; FertConfig ferts[4]; int fertCount; };
+struct StartTime { int hour; int minute; };
+struct Schedule { bool active; uint8_t days; StartTime starts[5]; int startCount; ZoneConfig zones[6]; };
+struct BackwashConfig { bool active; uint8_t days; int hour; int minute; int durationMins; };
+
+Schedule schedules[3];
+BackwashConfig bwConfig = {false, 0, 0, 0, 5};
+time_t irrSchedStart[6] = {0}; time_t irrSchedStop[6] = {0};
+time_t fertQueueStart[6][4] = {{0}};
+time_t fertQueueStop[6][4] = {{0}};
+int fertQueueComp[6][4] = {{0}};
+time_t bwStart = 0; time_t bwStop = 0;
+
+unsigned long pumpDemandStartTime = 0; bool pump1Active = false;
+unsigned long pumpRunStartTime = 0; 
+unsigned long fertDemandStartTime = 0; bool fertPumpActive = false;
+int lastCheckedMinute = -1;
+
+// 3 Phase Voltage and current limits
+float minV = 360.0, maxV = 450.0; float minA = 1.0, maxA = 50.0; bool protEnabled = false;
+float globalVRY = 0.0, globalVYB = 0.0, globalVBR = 0.0;
+float globalVoltage = 415.0; float globalCurrent = 0.0; float globalPower = 0.0; // v2: aggregate values pushed to the dashboard
+
+bool autoInterlockActive = false; int autoInterlockReason = 0;
+bool isEmergencyTripped = false; 
+bool lastEmergencyState = false; // ഫിക്സ്: ഫയർബേസ് ഇൻഫിനിറ്റ് ലൂപ്പ് തടയാനുള്ള ഗ്ലോബൽ ഫ്ലാഗ്
+
+unsigned long stableStartTime = 0; int motorRetryCount = 0;
+
+static int prevTickIrrZone = -1; static int prevTickFertZone = -1;
+static bool prevTickBwSafe = false;
+static int prevFlowPath = 0; // v3: 0=idle, 1=irrigation, 2=backwash - tracks direct path crossovers
+
+// --- HARDWARE CONTROL ---
+void controlRelay(int pin, bool turnOn) {
+    if (turnOn) digitalWrite(pin, LOW);
+    else digitalWrite(pin, HIGH);
+}
+
+// v5.1.0: separate control path for the 6 irrigation zone valves, which now live on the
+// MCP23017 IO expander instead of direct ESP32 GPIOs. Deliberately a different function
+// (not an overload/branch inside controlRelay()) because MCP23017 channel numbers (0-15) and
+// ESP32 GPIO numbers overlap in range - e.g. channel 4 here is NOT the same physical pin as
+// relay2_valveMain's GPIO 4 above. Keeping them as separate functions with separate pin
+// spaces makes it impossible to accidentally call digitalWrite() on what's actually an
+// expander channel number, or vice versa.
+void controlIrrZoneRelay(int channel, bool turnOn) {
+    if (!mcpReady) return; // fail safe: no I2C write if the expander was never detected
+    if (turnOn) mcp.digitalWrite(channel, LOW);
+    else mcp.digitalWrite(channel, HIGH);
+}
+
+void engageInterlock(int reason) {
+    if (!autoInterlockActive || autoInterlockReason != reason) {
+        autoInterlockActive = true; autoInterlockReason = reason; stableStartTime = 0; 
+        Serial.print(F("[INTERLOCK] Hardware Paused! Reason Code: ")); Serial.println(reason);
+        
+        if(WiFi.status() == WL_CONNECTED && Firebase.ready() && signupOK) { 
+            Firebase.RTDB.setInt(&fbdo, P("/system/interlockReason").c_str(), reason); 
+        }
+
+        if (!autoResumeEnabled) {
+            Serial.println(F("[INTERLOCK] Auto Resume OFF. Wiping active schedules & timers."));
+            manualIrrZone = 0; manualIrrStop = 0; pendingClearIrr = true;
+            manualFertZone = 0; manualFertStop = 0; pendingClearFert = true;
+            bwStart = 0; bwStop = 0;
+            
+            for(int i=0; i<6; i++) { 
+                irrSchedStart[i] = 0; irrSchedStop[i] = 0; 
+                for(int f=0; f<4; f++) { fertQueueStart[i][f] = 0; fertQueueStop[i][f] = 0; } 
+            }
+            
+            pendingResumeZone = 0; pendingResumeRemain = 0;
+            prefs.putInt("z", 0); prefs.putLong("r", 0); 
+            
+            if(WiFi.status() == WL_CONNECTED && Firebase.ready() && signupOK) {
+                Firebase.RTDB.setInt(&fbdo, P("/system/manualIrrZone").c_str(), 0);
+                Firebase.RTDB.setInt(&fbdo, P("/system/manualIrrMins").c_str(), 0);
+                Firebase.RTDB.setInt(&fbdo, P("/system/pendingZone").c_str(), 0);
+                Firebase.RTDB.setInt(&fbdo, P("/system/pendingRemain").c_str(), 0);
+            }
+        }
+    }
+}
+
+void releaseInterlock() {
+    if (autoInterlockActive) {
+        autoInterlockActive = false; autoInterlockReason = 0; stableStartTime = 0; pumpDemandStartTime = 0; 
+        Serial.println(F("[INTERLOCK] Power/Voltage is stable. Resuming Timers & Operations."));
+        if(WiFi.status() == WL_CONNECTED && Firebase.ready() && signupOK) {
+            Firebase.RTDB.setInt(&fbdo, P("/system/interlockReason").c_str(), 0);
+        }
+    }
+}
+
+void triggerEmergencyStop(int reasonCode) {
+    isEmergencyTripped = true; 
+    lastEmergencyState = true; // ഫിക്സ്: ഫയർബേസിൽ നിന്ന് റീഡ് ചെയ്ത് വീണ്ടും ട്രിഗർ ആകുന്നത് തടയുന്നു
+    autoInterlockActive = true; 
+    autoInterlockReason = reasonCode; 
+    
+    if(WiFi.status() == WL_CONNECTED && Firebase.ready() && signupOK) {
+        Firebase.RTDB.setInt(&fbdo, P("/system/lastTripReason").c_str(), reasonCode);
+        Firebase.RTDB.setBool(&fbdo, P("/system/emergencyStop").c_str(), true);
+    }
+    Serial.print(F("\n[!!! EMERGENCY TRIP !!!] Reason Code: ")); Serial.print(reasonCode); Serial.println(F(". System halted."));
+
+    manualIrrZone = 0; manualFertZone = 0; manualIrrStop = 0; manualFertStop = 0;
+    pendingClearIrr = false; pendingClearFert = false; bwStart = 0; bwStop = 0;
+    pump1Active = false; fertPumpActive = false; pumpDemandStartTime = 0; fertDemandStartTime = 0; motorRetryCount = 0;
+    
+    for(int i=0; i<6; i++) { 
+        irrSchedStart[i] = 0; irrSchedStop[i] = 0; 
+        for(int f=0; f<4; f++) { fertQueueStart[i][f] = 0; fertQueueStop[i][f] = 0; } 
+    }
+    prefs.putInt("z", 0); prefs.putLong("r", 0); 
+    if(WiFi.status() == WL_CONNECTED && Firebase.ready() && signupOK) {
+        Firebase.RTDB.setInt(&fbdo, P("/system/pendingZone").c_str(), 0);
+        Firebase.RTDB.setInt(&fbdo, P("/system/pendingRemain").c_str(), 0);
+    }
+}
+
+void loadScheduleIntoExecution(int sIndex) {
+  time_t now; time(&now); struct tm *timeinfo = localtime(&now);
+  int currentDayBitmask = (1 << timeinfo->tm_wday); time_t currentEpoch = now;
+  
+  Serial.print(F("[SCHEDULE] Slot ")); Serial.print(sIndex + 1); Serial.println(F(" execution initiated."));
+  
+  for(int i=0; i<6; i++) { 
+      irrSchedStart[i] = 0; irrSchedStop[i] = 0; 
+      for(int f=0; f<4; f++) { fertQueueStart[i][f] = 0; fertQueueStop[i][f] = 0; fertQueueComp[i][f] = 0; } 
+  }
+
+  for(int i=0; i<6; i++) {
+    if (schedules[sIndex].zones[i].waterMins > 0) {
+      irrSchedStart[i] = currentEpoch;
+      currentEpoch += (schedules[sIndex].zones[i].waterMins * 60); irrSchedStop[i] = currentEpoch;
+      time_t zoneStart = irrSchedStart[i]; struct tm *zTm = localtime(&zoneStart);
+      time_t zMidnight = zoneStart - (zTm->tm_hour * 3600) - (zTm->tm_min * 60) - zTm->tm_sec;
+      for(int f=0; f < schedules[sIndex].zones[i].fertCount; f++) {
+        FertConfig fc = schedules[sIndex].zones[i].ferts[f];
+        if ((fc.days & currentDayBitmask) != 0 && fc.mins > 0 && fc.comp > 0) {
+           time_t proposedStart = zMidnight + (fc.startHour * 3600) + (fc.startMinute * 60);
+           if (proposedStart < zoneStart && (proposedStart + 86400) <= irrSchedStop[i]) proposedStart += 86400;
+           time_t proposedStop = proposedStart + (fc.mins * 60);
+           if (proposedStart < irrSchedStart[i]) proposedStart = irrSchedStart[i];
+           if (proposedStop > irrSchedStop[i]) proposedStop = irrSchedStop[i];
+           if (proposedStop > proposedStart) { fertQueueStart[i][f] = proposedStart; fertQueueStop[i][f] = proposedStop; fertQueueComp[i][f] = fc.comp; }
+        }
+      }
+    }
+  }
+}
+
+void updateSystem() {
+  static time_t lastSysTime = 0;
+  time_t now; time(&now); if (now < 100000) return;
+
+  bool isScheduledRun = false;
+  for (int i = 0; i < 6; i++) { 
+      if (irrSchedStart[i] != 0 && irrSchedStop[i] != 0 && now >= irrSchedStart[i] && now < irrSchedStop[i]) { 
+          isScheduledRun = true; break; 
+      } 
+  }
+  bool isBackwashTime = (bwStart > 0 && bwStop > 0 && now >= bwStart && now < bwStop);
+
+  if (lastSysTime > 0) {
+      time_t shifted = now - lastSysTime;
+      if (shifted > 0 && shifted < 100) { 
+          if (autoInterlockActive) {
+              if (autoResumeEnabled) {
+                  if (manualIrrStop > 0) manualIrrStop += shifted;
+                  if (bwStart > 0) bwStart += shifted;
+                  if (bwStop > 0) bwStop += shifted;
+                  for(int i=0; i<6; i++) {
+                      if (irrSchedStart[i] > 0) irrSchedStart[i] += shifted;
+                      if (irrSchedStop[i] > 0) irrSchedStop[i] += shifted;
+                      for(int f=0; f<4; f++) { 
+                          if (fertQueueStart[i][f] > 0) fertQueueStart[i][f] += shifted; 
+                          if (fertQueueStop[i][f] > 0) fertQueueStop[i][f] += shifted; 
+                      }
+                  }
+              } else {
+                  if (manualIrrZone > 0) { manualIrrZone = 0; manualIrrStop = 0; pendingClearIrr = true; }
+                  if (manualFertZone > 0) { manualFertZone = 0; manualFertStop = 0; pendingClearFert = true; }
+                  bwStart = 0; bwStop = 0;
+                  for(int i=0; i<6; i++) {
+                      irrSchedStart[i] = 0; irrSchedStop[i] = 0;
+                      for(int f=0; f<4; f++) { fertQueueStart[i][f] = 0; fertQueueStop[i][f] = 0; }
+                  }
+              }
+          } else if (isScheduledRun || isBackwashTime) {
+              if (manualIrrZone > 0 && manualIrrStop > now) manualIrrStop += shifted;
+              if (manualFertZone > 0 && manualFertStop > now) manualFertStop += shifted;
+          }
+      }
+  }
+  lastSysTime = now;
+
+  if (now >= bwStop && bwStop > 0) { bwStart = 0; bwStop = 0; ignoreFirebaseUntil = millis() + 1500; isBackwashTime = false; }
+
+  if (manualIrrZone > 0 && manualIrrStop > 0 && now >= manualIrrStop) { 
+      manualIrrZone = 0; manualIrrStop = 0; pendingClearIrr = true; 
+      if(WiFi.status() == WL_CONNECTED && Firebase.ready() && signupOK) { Firebase.RTDB.setInt(&fbdo, P("/system/manualIrrZone").c_str(), 0); Firebase.RTDB.setInt(&fbdo, P("/system/manualIrrMins").c_str(), 0); }
+  }
+  if (manualFertZone > 0 && manualFertStop > 0 && now >= manualFertStop) { 
+      manualFertZone = 0; manualFertStop = 0; pendingClearFert = true; 
+      if(WiFi.status() == WL_CONNECTED && Firebase.ready() && signupOK) { Firebase.RTDB.setInt(&fbdo, P("/system/manualFertZone").c_str(), 0); Firebase.RTDB.setInt(&fbdo, P("/system/manualFertMins").c_str(), 0); }
+  }
+
+  if (pendingResumeZone > 0 && pendingResumeRemain > 0 && !isScheduledRun && !isBackwashTime) {
+      if (autoResumeEnabled) {
+          manualIrrZone = pendingResumeZone;
+          manualIrrStop = now + pendingResumeRemain;
+          Serial.print(F("[POWER] Recovery! Auto Resume ON. Resuming Zone ")); Serial.print(pendingResumeZone); Serial.print(F(" for ")); Serial.print(pendingResumeRemain); Serial.println(F(" seconds"));
+      } else {
+          Serial.println(F("[POWER] Old memory found, but Auto Resume is OFF. Memory wiped!"));
+      }
+      
+      pendingResumeZone = 0; pendingResumeRemain = 0;
+      prefs.putInt("z", 0); prefs.putLong("r", 0);
+      
+      if(WiFi.status() == WL_CONNECTED && Firebase.ready() && signupOK) {
+          Firebase.RTDB.setInt(&fbdo, P("/system/pendingZone").c_str(), 0);
+          Firebase.RTDB.setInt(&fbdo, P("/system/pendingRemain").c_str(), 0);
+      }
+  }
+
+  int activeIrrZone = -1;
+  time_t currentIrrStop = 0;
+
+  for (int i = 0; i < 6; i++) { 
+      if (irrSchedStart[i] != 0 && irrSchedStop[i] != 0 && now >= irrSchedStart[i] && now < irrSchedStop[i]) { 
+          activeIrrZone = i; currentIrrStop = irrSchedStop[i]; break; 
+      } 
+  }
+
+  if (!isScheduledRun && manualIrrZone > 0 && manualIrrZone <= 6) {
+      activeIrrZone = manualIrrZone - 1; currentIrrStop = manualIrrStop;
+  }
+  if (isBackwashTime) { activeIrrZone = -1; currentIrrStop = 0; }
+
+  if (activeIrrZone != -1 && currentIrrStop > 0) {
+      if (millis() - lastPrefSave > 60000) { 
+          lastPrefSave = millis();
+          long remain = currentIrrStop - now;
+          if (remain > 0) {
+              if (autoResumeEnabled) { 
+                  prefs.putInt("z", activeIrrZone + 1);
+                  prefs.putLong("r", remain);
+                  if(WiFi.status() == WL_CONNECTED && Firebase.ready() && signupOK) {
+                      Firebase.RTDB.setInt(&fbdo, P("/system/pendingZone").c_str(), activeIrrZone + 1);
+                      Firebase.RTDB.setInt(&fbdo, P("/system/pendingRemain").c_str(), remain);
+                  }
+              } else {
+                  prefs.putInt("z", 0);
+                  prefs.putLong("r", 0);
+              }
+          }
+      }
+  } else if (lastActiveIrrZone != -1 && activeIrrZone == -1) {
+      prefs.putInt("z", 0); prefs.putLong("r", 0); 
+      if(WiFi.status() == WL_CONNECTED && Firebase.ready() && signupOK) {
+          Firebase.RTDB.setInt(&fbdo, P("/system/pendingZone").c_str(), 0);
+          Firebase.RTDB.setInt(&fbdo, P("/system/pendingRemain").c_str(), 0);
+      }
+  }
+
+  int activeFertZone = -1;
+  time_t currentFertStop = 0;
+
+  if (activeIrrZone != -1) {
+      if (manualFertZone > 0 && manualFertZone <= 4 && !isScheduledRun) {
+          activeFertZone = manualFertZone - 1; 
+          currentFertStop = manualFertStop;
+      } else if (isScheduledRun) {
+          for(int f=0; f<4; f++) {
+            if (fertQueueStart[activeIrrZone][f] != 0 && fertQueueStop[activeIrrZone][f] != 0 && now >= fertQueueStart[activeIrrZone][f] && now < fertQueueStop[activeIrrZone][f]) {
+                int assignedComp = fertQueueComp[activeIrrZone][f];
+                if (assignedComp > 0 && assignedComp <= 4) { activeFertZone = assignedComp - 1; currentFertStop = fertQueueStop[activeIrrZone][f]; break; }
+            }
+          }
+      }
+  } else {
+      if (manualFertZone != 0 && !isScheduledRun && !isBackwashTime) { 
+          manualFertZone = 0; manualFertStop = 0; pendingClearFert = true; 
+          if(WiFi.status() == WL_CONNECTED && Firebase.ready() && signupOK) { 
+              Firebase.RTDB.setInt(&fbdo, P("/system/manualFertZone").c_str(), 0); 
+              Firebase.RTDB.setInt(&fbdo, P("/system/manualFertMins").c_str(), 0); 
+          }
+      }
+  }
+
+  int hwIrrZone = activeIrrZone;
+  int hwFertZone = activeFertZone;
+  bool hwBwSafe = isBackwashTime;
+
+  if (autoInterlockActive) {
+      hwIrrZone = -1; hwFertZone = -1; hwBwSafe = false;
+  }
+
+  static unsigned long irrOverlapTimer = 0; bool isIrrOverlapping = false;
+  if (hwIrrZone != prevTickIrrZone) { 
+      if (prevTickIrrZone != -1) { 
+          heldIrrZone = prevTickIrrZone; irrOverlapTimer = millis(); 
+          Serial.print(F("[ZONE] Zone ")); Serial.print(prevTickIrrZone + 1); Serial.println(F(" valve CLOSED."));
+      }
+      if (hwIrrZone == -1 || prevTickIrrZone == -1) { pumpDemandStartTime = 0; pump1Active = false; }
+      if (hwIrrZone == -1) { fertDemandStartTime = 0; fertPumpActive = false; }
+      if (hwIrrZone != -1) { 
+          Serial.print(F("[ZONE] Zone ")); Serial.print(hwIrrZone + 1); Serial.println(F(" valve OPENED."));
+      }
+  }
+  
+  isIrrOverlapping = (heldIrrZone != -1 && (millis() - irrOverlapTimer < 3000)); 
+  if (!isIrrOverlapping) heldIrrZone = -1;
+
+  static unsigned long fertOverlapTimer = 0; bool isFertOverlapping = false;
+  if (hwFertZone != prevTickFertZone) {
+      if (prevTickFertZone != -1) { 
+          heldFertZone = prevTickFertZone; fertOverlapTimer = millis(); 
+          Serial.print(F("[FERT VALVE] Compartment ")); Serial.print(prevTickFertZone + 1); Serial.println(F(" Valve CLOSED."));
+      }
+      if (hwFertZone == -1 || prevTickFertZone == -1) { fertDemandStartTime = 0; fertPumpActive = false; }
+      if (hwFertZone != -1) { 
+          Serial.print(F("[FERT VALVE] Compartment ")); Serial.print(hwFertZone + 1); Serial.println(F(" Valve OPENED."));
+      }
+  }
+  
+  isFertOverlapping = (heldFertZone != -1 && (millis() - fertOverlapTimer < 3000));
+  if (!isFertOverlapping) heldFertZone = -1;
+
+  static unsigned long bwOverlapTimer = 0; 
+  static bool heldBwValves = false;
+
+  if (hwBwSafe != prevTickBwSafe) {
+      if (hwBwSafe == false && prevTickBwSafe == true) { heldBwValves = true; bwOverlapTimer = millis(); } 
+      else if (hwBwSafe == true) { heldBwValves = false; }
+  }
+  if (heldBwValves && (millis() - bwOverlapTimer >= 3000)) heldBwValves = false;
+
+  prevTickIrrZone = hwIrrZone; prevTickFertZone = hwFertZone; prevTickBwSafe = hwBwSafe;
+
+  // v3 fix: prevent a water-hammer-prone hot-swap when the flow path switches directly
+  // between irrigation and backwash (e.g. a backwash schedule collides with an active
+  // zone). Without this, the main valve slams shut and the flush valve snaps open in the
+  // same tick while the pump keeps running continuously through the switch. Detect a
+  // direct crossover between two ACTIVE paths (no idle tick in between) and force the
+  // same pump-off + 3s demand debounce already used at every normal startup, so the
+  // valves finish settling into the new path before the pump pushes flow into it again.
+  int newFlowPath = hwBwSafe ? 2 : (hwIrrZone != -1 ? 1 : 0); // 0=idle, 1=irrigation, 2=backwash
+  if (newFlowPath != prevFlowPath && newFlowPath != 0 && prevFlowPath != 0) {
+      pump1Active = false; pumpDemandStartTime = 0;
+      Serial.println(F("[SAFETY] Flow path switched (irrigation<->backwash) - pausing pump to let valves settle."));
+  }
+  prevFlowPath = newFlowPath;
+
+  bool needsMainPump = (hwIrrZone != -1) || hwBwSafe;
+  if (needsMainPump) {
+    if (!pump1Active) { if (pumpDemandStartTime == 0) pumpDemandStartTime = millis(); if (millis() - pumpDemandStartTime >= 3000) { pump1Active = true; pumpRunStartTime = millis(); } }
+  } else { pump1Active = false; pumpDemandStartTime = 0; }
+
+  if (hwFertZone != -1 && pump1Active) { 
+      if (!fertPumpActive) { 
+          if (fertDemandStartTime == 0) fertDemandStartTime = millis(); 
+          if (millis() - fertDemandStartTime >= 3000) { fertPumpActive = true; } 
+      } 
+  } else { 
+      fertPumpActive = false; fertDemandStartTime = 0; 
+  }
+
+  bool finalPumpMain = pump1Active;
+  bool finalFertPump = fertPumpActive;
+  bool finalMainValve = false;
+  bool finalFlushIn = false;
+
+  if (autoInterlockActive) { finalPumpMain = false; finalFertPump = false; }
+
+  if (hwBwSafe || heldBwValves) {
+      finalMainValve = false; finalFlushIn = true;
+  } else {
+      finalMainValve = (hwIrrZone != -1 || heldIrrZone != -1);
+      finalFlushIn = false; 
+  }
+
+  controlRelay(relay1_pumpMain, finalPumpMain); 
+  controlRelay(relayFertPump, finalFertPump);
+  controlRelay(relay2_valveMain, finalMainValve); 
+  controlRelay(relay3_flushIn, finalFlushIn); 
+
+  for (int i = 0; i < 6; i++) {
+      bool on = (i == hwIrrZone) || (i == heldIrrZone);
+      controlIrrZoneRelay(irrZonePins[i], on); // v5.1.0: irrigation zones are on the MCP23017 now
+  }
+  for (int i = 0; i < 4; i++) {
+      bool on = (i == hwFertZone) || (i == heldFertZone); 
+      controlRelay(fertZonePins[i], on);
+  }
+
+  if(WiFi.status() == WL_CONNECTED && Firebase.ready() && signupOK) {
+    esp_task_wdt_reset(); // v2: pet the watchdog before this batch of Firebase telemetry writes
+    if (activeIrrZone != lastActiveIrrZone) { Firebase.RTDB.setInt(&fbdo, P("/system/activeIrrZone").c_str(), activeIrrZone != -1 ? activeIrrZone + 1 : 0); lastActiveIrrZone = activeIrrZone; }
+    if (activeFertZone != lastActiveFertZone) { Firebase.RTDB.setInt(&fbdo, P("/system/activeFertZone").c_str(), activeFertZone != -1 ? activeFertZone + 1 : 0); lastActiveFertZone = activeFertZone; }
+    
+    static time_t lastPushIrrStop = 0; if (currentIrrStop != lastPushIrrStop) { Firebase.RTDB.setInt(&fbdo, P("/system/activeIrrStop").c_str(), (int)currentIrrStop); lastPushIrrStop = currentIrrStop; }
+    static time_t lastPushFertStop = 0; if (currentFertStop != lastPushFertStop) { Firebase.RTDB.setInt(&fbdo, P("/system/activeFertStop").c_str(), (int)currentFertStop); lastPushFertStop = currentFertStop; }
+
+    if (pump1Active != lastPump1Active) { 
+        Firebase.RTDB.setBool(&fbdo, P("/system/pump1Active").c_str(), pump1Active); 
+        if (pump1Active) { Serial.println(F("[PUMP] Main Water Pump TURNED ON")); }
+        else { Serial.println(F("[PUMP] Main Water Pump TURNED OFF")); }
+        lastPump1Active = pump1Active; 
+    }
+    
+    if (fertPumpActive != lastFertPumpActive) { 
+        Firebase.RTDB.setBool(&fbdo, P("/system/fertPumpActive").c_str(), fertPumpActive); 
+        if (fertPumpActive) { Serial.println(F("[PUMP] Fertilizer Pump TURNED ON")); }
+        else { Serial.println(F("[PUMP] Fertilizer Pump TURNED OFF")); }
+        lastFertPumpActive = fertPumpActive; 
+    }
+    
+    static bool lastBwState = false; if (hwBwSafe != lastBwState) { Firebase.RTDB.setBool(&fbdo, P("/system/isBackwashActive").c_str(), hwBwSafe); lastBwState = hwBwSafe; }
+
+    static int lastIrrRem = -1;
+    static int lastFertRem = -1;
+    static unsigned long lastRemainPush = 0;
+    
+    if (millis() - lastRemainPush >= 5000) { 
+        lastRemainPush = millis();
+        int irrRem = (currentIrrStop > now) ? (currentIrrStop - now) : 0;
+        int fertRem = (currentFertStop > now) ? (currentFertStop - now) : 0;
+        
+        if (irrRem != lastIrrRem || fertRem != lastFertRem) {
+            Firebase.RTDB.setInt(&fbdo, P("/system/activeIrrRemain").c_str(), irrRem);
+            Firebase.RTDB.setInt(&fbdo, P("/system/activeFertRemain").c_str(), fertRem);
+            lastIrrRem = irrRem;
+            lastFertRem = fertRem;
+        }
+    }
+  }
+}
+
+void checkRecurringSchedules() {
+  time_t now; time(&now); if (now < 100000) return;
+  struct tm *timeinfo = localtime(&now);
+  if (timeinfo->tm_min != lastCheckedMinute) {
+    lastCheckedMinute = timeinfo->tm_min; int currentDay = timeinfo->tm_wday; int currentHour = timeinfo->tm_hour; int currentMinute = timeinfo->tm_min;
+    
+    for(int s=0; s<3; s++) { 
+        if (schedules[s].active && (schedules[s].days & (1 << currentDay))) { 
+            for(int st=0; st < schedules[s].startCount; st++) {
+                if (schedules[s].starts[st].hour == currentHour && schedules[s].starts[st].minute == currentMinute) { loadScheduleIntoExecution(s); }
+            }
+        } 
+    }
+
+    if (bwConfig.active && (bwConfig.days & (1 << currentDay))) { 
+        if (bwConfig.hour == currentHour && bwConfig.minute == currentMinute) { 
+            if (bwStart == 0) {
+                bwStart = now; bwStop = now + (bwConfig.durationMins * 60); 
+                Serial.println(F("[SCHEDULE] Auto-Backwash Initiated."));
+            }
+        } 
+    }
+  }
+}
+
+float convertRegistersToFloat(uint16_t reg1, uint16_t reg2) {
+    union { uint32_t u32; float f; } data;
+    data.u32 = ((uint32_t)reg2 << 16) | (uint32_t)reg1;
+    return data.f;
+}
+
+static bool readVoltageNext = true;
+static int modbusFailCount = 0;
+static bool isPowerOut = false;
+
+void readPowerMeterData() {
+    esp_task_wdt_reset(); 
+
+    // v5.0.9 fix: reason 5 (Modbus/meter connection lost) used to be excluded from this
+    // auto-release check, so once tripped it never cleared even after turning hardware
+    // protection off - "<= 4" is now "<= 5" to include it, matching every other auto trip.
+    if (!protEnabled && autoInterlockActive && !isEmergencyTripped && (autoInterlockReason == 6 || (autoInterlockReason >= 1 && autoInterlockReason <= 5))) {
+        releaseInterlock();
+    }
+
+    uint8_t result;
+
+    if (readVoltageNext) {
+        result = node.readHoldingRegisters(134, 6); 
+        
+        if (result == node.ku8MBSuccess) {
+            modbusFailCount = 0;
+            globalVRY = convertRegistersToFloat(node.getResponseBuffer(0), node.getResponseBuffer(1));
+            globalVYB = convertRegistersToFloat(node.getResponseBuffer(2), node.getResponseBuffer(3));
+            globalVBR = convertRegistersToFloat(node.getResponseBuffer(4), node.getResponseBuffer(5));
+
+            if (globalVRY < 50.0) globalVRY = 0.0;
+            if (globalVYB < 50.0) globalVYB = 0.0;
+            if (globalVBR < 50.0) globalVBR = 0.0;
+
+            globalVoltage = (globalVRY + globalVYB + globalVBR) / 3.0; 
+            
+            if (isPowerOut) {
+                isPowerOut = false;
+                Serial.println(F("[POWER] Power Restored!"));
+            }
+
+            bool phaseLost = (globalVRY == 0.0 || globalVYB == 0.0 || globalVBR == 0.0);
+            bool vGood = (globalVRY >= minV && globalVRY <= maxV) && 
+                         (globalVYB >= minV && globalVYB <= maxV) && 
+                         (globalVBR >= minV && globalVBR <= maxV);
+
+            if (protEnabled && phaseLost) { 
+                engageInterlock(6); 
+            } else if (protEnabled && !vGood) { 
+                engageInterlock(1); 
+            } else { 
+                if (autoInterlockActive && !isEmergencyTripped) {
+                    if (stableStartTime == 0) {
+                        stableStartTime = millis(); 
+                    } else if (millis() - stableStartTime >= 10000) { 
+                        releaseInterlock();
+                    }
+                }
+            }
+            
+        } else { 
+            globalVRY = -1.0; globalVYB = -1.0; globalVBR = -1.0; globalVoltage = -1.0; 
+            modbusFailCount++;
+            stableStartTime = 0; 
+            
+            if (modbusFailCount >= 3) {
+                if (!isPowerOut) {
+                    isPowerOut = true;
+                    Serial.println(F("[POWER] Connection to meter lost."));
+                }
+                // v5.0.9 fix: this trip was unconditional - it fired even with hardware
+                // protection (protEnabled) turned off, unlike the phase-lost/voltage/current
+                // checks elsewhere in this function which all correctly check protEnabled
+                // first. Now it only engages the interlock when protection is actually on;
+                // the "Connection to meter lost" log line above still prints either way, so
+                // you still see it noted, it just won't lock the hardware with protection off.
+                if (protEnabled && (!autoInterlockActive || autoInterlockReason != 5)) {
+                    engageInterlock(5);
+                }
+            }
+        }
+        readVoltageNext = false; 
+        
+    } else {
+        result = node.readHoldingRegisters(148, 2);
+        if (result == node.ku8MBSuccess) {
+            modbusFailCount = 0; 
+            globalCurrent = convertRegistersToFloat(node.getResponseBuffer(0), node.getResponseBuffer(1));
+            
+            if (isPowerOut) {
+                isPowerOut = false;
+                Serial.println(F("[POWER] Power Restored!"));
+            }
+
+            if (protEnabled && !autoInterlockActive && pump1Active && (millis() - pumpRunStartTime > 5000)) {
+                if (globalCurrent < 0) { 
+                    engageInterlock(4); 
+                } else if (globalCurrent < minA || globalCurrent > maxA) {
+                    int faultCode = (globalCurrent < minA) ? 2 : 3; 
+                    motorRetryCount++; 
+                    if (motorRetryCount >= 2) { 
+                        triggerEmergencyStop(faultCode); 
+                    } else { 
+                        engageInterlock(faultCode); 
+                    }
+                } else { 
+                    if (millis() - pumpRunStartTime > 25000 && motorRetryCount > 0) motorRetryCount = 0; 
+                }
+            }
+        } else { 
+            globalCurrent = -1.0; 
+            modbusFailCount++;
+            stableStartTime = 0; 
+            
+            if (modbusFailCount >= 3) {
+                if (!isPowerOut) {
+                    isPowerOut = true;
+                    Serial.println(F("[POWER] Connection to meter lost."));
+                }
+                // v5.0.9 fix: this trip was unconditional - it fired even with hardware
+                // protection (protEnabled) turned off, unlike the phase-lost/voltage/current
+                // checks elsewhere in this function which all correctly check protEnabled
+                // first. Now it only engages the interlock when protection is actually on;
+                // the "Connection to meter lost" log line above still prints either way, so
+                // you still see it noted, it just won't lock the hardware with protection off.
+                if (protEnabled && (!autoInterlockActive || autoInterlockReason != 5)) {
+                    engageInterlock(5);
+                }
+            }
+        }
+        readVoltageNext = true;
+
+        if(WiFi.status() == WL_CONNECTED && Firebase.ready() && signupOK) {
+            // v2 fix: the dashboard reads /system/voltage and /system/power directly, but v1
+            // only pushed the per-phase values below, so those two dashboard tiles never populated.
+            // globalPower is an approximation (sqrt(3) x V x I, assumes power factor ~1). If the
+            // L&T WL4400 exposes a true active-power (kW) register, read that instead for accuracy.
+            globalPower = (globalVoltage > 0 && globalCurrent >= 0) ? (1.732 * globalVoltage * globalCurrent) : -1.0;
+            Firebase.RTDB.setFloat(&fbdo, P("/system/voltageRY").c_str(), globalVRY);
+            Firebase.RTDB.setFloat(&fbdo, P("/system/voltageYB").c_str(), globalVYB);
+            Firebase.RTDB.setFloat(&fbdo, P("/system/voltageBR").c_str(), globalVBR);
+            Firebase.RTDB.setFloat(&fbdo, P("/system/voltage").c_str(), globalVoltage);
+            Firebase.RTDB.setFloat(&fbdo, P("/system/current").c_str(), globalCurrent);
+            Firebase.RTDB.setFloat(&fbdo, P("/system/power").c_str(), globalPower);
+        }
+    }
+}
+
+int getJsonIntSafe(FirebaseJson &json, const char* pathArr, const char* pathObj, int defaultVal) {
+    FirebaseJsonData result; 
+    json.get(result, pathArr);
+    if (result.success) return result.intValue;
+    json.get(result, pathObj); 
+    if (result.success) return result.intValue; 
+    return defaultVal;
+}
+
+void readFastFirebaseData() {
+  if (Firebase.ready() && signupOK) {
+      esp_task_wdt_reset();
+
+      if (Firebase.RTDB.getJSON(&fbdo, P("/system").c_str())) {
+          esp_task_wdt_reset();
+
+          FirebaseJson &json = fbdo.jsonObject(); FirebaseJsonData result;
+          
+          json.get(result, "motorConfig/minV"); if(result.success) minV = result.floatValue;
+          json.get(result, "motorConfig/maxV"); if(result.success) maxV = result.floatValue;
+          json.get(result, "motorConfig/minA"); if(result.success) minA = result.floatValue;
+          json.get(result, "motorConfig/maxA"); if(result.success) maxA = result.floatValue;
+          
+          json.get(result, "motorConfig/enabled"); 
+          if(result.success) {
+              protEnabled = result.boolValue;
+          }
+
+          json.get(result, "autoResumeEnabled"); if(result.success) autoResumeEnabled = result.boolValue;
+
+          // ഫിക്സ്: ഫയർബേസിൽ നിന്ന് എമർജൻസി റീഡ് ചെയ്ത് സ്റ്റക്ക് ആവാതിരിക്കാനുള്ള കോഡ്
+          bool incomingEmergency = false;
+          json.get(result, "emergencyStop");
+          if (result.success) incomingEmergency = result.boolValue;
+
+          if (incomingEmergency && !lastEmergencyState) {
+              if (!isEmergencyTripped) {
+                  triggerEmergencyStop(0); 
+                  Firebase.RTDB.setInt(&fbdo, P("/system/manualIrrZone").c_str(), 0); 
+                  Firebase.RTDB.setInt(&fbdo, P("/system/manualFertZone").c_str(), 0); 
+                  Firebase.RTDB.setBool(&fbdo, P("/system/isBackwashActive").c_str(), false); 
+                  ignoreFirebaseUntil = millis() + 1500;
+              }
+          } else if (!incomingEmergency && lastEmergencyState) {
+              isEmergencyTripped = false;
+              releaseInterlock();
+              motorRetryCount = 0; 
+          }
+          lastEmergencyState = incomingEmergency;
+
+          if (!isEmergencyTripped) {
+              int incomingIrrMins = 0; json.get(result, "manualIrrMins"); if (result.success) incomingIrrMins = result.intValue;
+              json.get(result, "manualIrrZone");
+              if(result.success) {
+                  int newIrrZone = result.intValue;
+                  if (pendingClearIrr) {
+                      if (newIrrZone != 0) { Firebase.RTDB.setInt(&fbdo, P("/system/manualIrrZone").c_str(), 0); Firebase.RTDB.setInt(&fbdo, P("/system/manualIrrMins").c_str(), 0); } else pendingClearIrr = false; 
+                  } else {
+                      if (newIrrZone != manualIrrZone) {
+                          if (autoInterlockActive && !autoResumeEnabled && newIrrZone > 0) {
+                              Firebase.RTDB.setInt(&fbdo, P("/system/manualIrrZone").c_str(), 0);
+                              Firebase.RTDB.setInt(&fbdo, P("/system/manualIrrMins").c_str(), 0);
+                          } else {
+                              manualIrrZone = newIrrZone;
+                              if (manualIrrZone > 0) { time_t now; time(&now); if (incomingIrrMins > 0) manualIrrStop = now + (incomingIrrMins * 60); else manualIrrStop = 0; } else manualIrrStop = 0; 
+                          }
+                      }
+                  }
+              }
+
+              int incomingFertMins = 0; json.get(result, "manualFertMins"); if (result.success) incomingFertMins = result.intValue;
+              json.get(result, "manualFertZone");
+              if(result.success) {
+                  int newFertZone = result.intValue;
+                  if (pendingClearFert) {
+                      if (newFertZone != 0) { Firebase.RTDB.setInt(&fbdo, P("/system/manualFertZone").c_str(), 0); Firebase.RTDB.setInt(&fbdo, P("/system/manualFertMins").c_str(), 0); } else pendingClearFert = false; 
+                  } else {
+                      if (newFertZone != manualFertZone) {
+                          if (autoInterlockActive && !autoResumeEnabled && newFertZone > 0) {
+                              Firebase.RTDB.setInt(&fbdo, P("/system/manualFertZone").c_str(), 0);
+                              Firebase.RTDB.setInt(&fbdo, P("/system/manualFertMins").c_str(), 0);
+                          } else {
+                              manualFertZone = newFertZone;
+                              if (manualFertZone > 0) { 
+                                  time_t now; time(&now); 
+                                  if (incomingFertMins > 0) manualFertStop = now + (incomingFertMins * 60); else manualFertStop = 0; 
+                              } else manualFertStop = 0; 
+                          }
+                      }
+                  }
+              }
+          }
+      }
+  }
+}
+
+void readSlowFirebaseData() {
+    if (Firebase.ready() && signupOK) {
+        esp_task_wdt_reset(); 
+
+        if (Firebase.RTDB.getJSON(&fbdo, P("/schedules").c_str())) {
+            
+            esp_task_wdt_reset();
+
+            FirebaseJson &json = fbdo.jsonObject(); 
+            FirebaseJsonData result;
+
+            json.get(result, "backwash/active");
+            if(result.success) {
+                bwConfig.active = result.boolValue;
+                bwConfig.days = getJsonIntSafe(json, "backwash/days", "backwash/days", 0);
+                bwConfig.hour = getJsonIntSafe(json, "backwash/hour", "backwash/hour", 0); 
+                bwConfig.minute = getJsonIntSafe(json, "backwash/minute", "backwash/minute", 0);
+                bwConfig.durationMins = getJsonIntSafe(json, "backwash/durationMins", "backwash/durationMins", 5);
+            } else {
+                bwConfig.active = false;
+            }
+            
+            char pathArr[64];
+            char pathObj[64];
+            char sPath[32];
+
+            for(int s=0; s<3; s++) {
+                esp_task_wdt_reset(); 
+
+                snprintf(sPath, sizeof(sPath), "slot_%d/", s);
+                snprintf(pathObj, sizeof(pathObj), "%sactive", sPath);
+                json.get(result, pathObj);
+                
+                if(result.success) {
+                   schedules[s].active = result.boolValue;
+                   snprintf(pathObj, sizeof(pathObj), "%sdays", sPath);
+                   schedules[s].days = getJsonIntSafe(json, pathObj, pathObj, 0);
+                   
+                   int stCount = 0;
+                   for(int st=0; st<5; st++) {
+                       snprintf(pathArr, sizeof(pathArr), "%sstarts/[%d]/hour", sPath, st);
+                       snprintf(pathObj, sizeof(pathObj), "%sstarts/%d/hour", sPath, st);
+                       int h = getJsonIntSafe(json, pathArr, pathObj, -1);
+                       
+                       if (h != -1) { 
+                           schedules[s].starts[stCount].hour = h; 
+                           snprintf(pathArr, sizeof(pathArr), "%sstarts/[%d]/minute", sPath, st);
+                           snprintf(pathObj, sizeof(pathObj), "%sstarts/%d/minute", sPath, st);
+                           schedules[s].starts[stCount].minute = getJsonIntSafe(json, pathArr, pathObj, 0); 
+                           stCount++; 
+                       }
+                   }
+                   if(stCount == 0) {
+                       snprintf(pathObj, sizeof(pathObj), "%shour", sPath);
+                       int h = getJsonIntSafe(json, pathObj, pathObj, -1);
+                       if(h != -1) { 
+                           schedules[s].starts[0].hour = h; 
+                           snprintf(pathObj, sizeof(pathObj), "%sminute", sPath);
+                           schedules[s].starts[0].minute = getJsonIntSafe(json, pathObj, pathObj, 0); 
+                           stCount = 1; 
+                       }
+                   }
+                   schedules[s].startCount = stCount;
+
+                   for(int z=0; z<6; z++) {
+                     snprintf(pathArr, sizeof(pathArr), "%szones/[%d]/waterMins", sPath, z);
+                     snprintf(pathObj, sizeof(pathObj), "%szones/%d/waterMins", sPath, z);
+                     schedules[s].zones[z].waterMins = getJsonIntSafe(json, pathArr, pathObj, 0);
+                     if (schedules[s].zones[z].waterMins > 300) schedules[s].zones[z].waterMins = 300;
+                     
+                     int fCount = 0;
+                     for(int f=0; f<4; f++) {
+                        snprintf(pathArr, sizeof(pathArr), "%szones/[%d]/ferts/[%d]/comp", sPath, z, f);
+                        snprintf(pathObj, sizeof(pathObj), "%szones/%d/ferts/%d/comp", sPath, z, f);
+                        int compFound = getJsonIntSafe(json, pathArr, pathObj, 0);
+                        
+                        if(compFound > 0) {
+                           schedules[s].zones[z].ferts[fCount].comp = compFound;
+                           
+                           snprintf(pathArr, sizeof(pathArr), "%szones/[%d]/ferts/[%d]/mins", sPath, z, f);
+                           snprintf(pathObj, sizeof(pathObj), "%szones/%d/ferts/%d/mins", sPath, z, f);
+                           schedules[s].zones[z].ferts[fCount].mins = getJsonIntSafe(json, pathArr, pathObj, 0);
+                           
+                           snprintf(pathArr, sizeof(pathArr), "%szones/[%d]/ferts/[%d]/startHour", sPath, z, f);
+                           snprintf(pathObj, sizeof(pathObj), "%szones/%d/ferts/%d/startHour", sPath, z, f);
+                           schedules[s].zones[z].ferts[fCount].startHour = getJsonIntSafe(json, pathArr, pathObj, 0);
+                           
+                           snprintf(pathArr, sizeof(pathArr), "%szones/[%d]/ferts/[%d]/startMinute", sPath, z, f);
+                           snprintf(pathObj, sizeof(pathObj), "%szones/%d/ferts/%d/startMinute", sPath, z, f);
+                           schedules[s].zones[z].ferts[fCount].startMinute = getJsonIntSafe(json, pathArr, pathObj, 0);
+                           
+                           snprintf(pathArr, sizeof(pathArr), "%szones/[%d]/ferts/[%d]/days", sPath, z, f);
+                           snprintf(pathObj, sizeof(pathObj), "%szones/%d/ferts/%d/days", sPath, z, f);
+                           schedules[s].zones[z].ferts[fCount].days = getJsonIntSafe(json, pathArr, pathObj, 0);
+                           fCount++;
+                        }
+                     }
+                     schedules[s].zones[z].fertCount = fCount;
+                   }
+                } else schedules[s].active = false;
+            }
+        }
+    }
+}
+
+void sendHeartbeat() {
+  if (Firebase.ready() && signupOK) {
+      time_t now; time(&now);
+      if (now > 100000) { Firebase.RTDB.setInt(&fbdo, P("/system/heartbeat").c_str(), now); Firebase.RTDB.setInt(&fbdo, P("/system/rssi").c_str(), WiFi.RSSI()); }
+  }
+}
+
+// v6.1.0: GitHub-Releases OTA update check. Called from loop() on a long timer (see
+// OTA_CHECK_INTERVAL_MS) - never mid-irrigation (gated on isSystemBusy()), so a customer's
+// active watering cycle is never interrupted by a background firmware update.
+//
+// Deliberately does NOT contain any rollback logic of its own - that safety net (the NVS
+// "bootGuard" 3-strikes counter + esp_ota_mark_app_invalid_rollback_and_reboot()) already
+// exists in setup() and applies to every image regardless of how it got there, USB or OTA. If
+// a pulled update never reaches the healthy checkpoint, that existing mechanism reverts to
+// THIS firmware automatically - this function's only job is checking for and downloading a
+// new version.
+void checkForFirmwareUpdate() {
+    if (WiFi.status() != WL_CONNECTED) return;
+    if (isSystemBusy()) {
+        Serial.println(F("[OTA] Skipping scheduled update check - system busy (active zone/fert/backwash running)."));
+        return;
+    }
+
+    Serial.println(F("[OTA] Checking GitHub for a newer firmware version..."));
+
+    WiFiClientSecure versionClient;
+    versionClient.setInsecure(); // TODO before wide field deployment: pin GitHub's CA cert instead of skipping validation
+    HTTPClient http;
+    http.begin(versionClient, GITHUB_VERSION_URL);
+    http.addHeader("User-Agent", "SIP-Controller-ESP32"); // raw.githubusercontent.com doesn't require this, but costs nothing to set
+    int httpCode = http.GET();
+
+    if (httpCode != 200) {
+        Serial.printf("[OTA] Version check failed - HTTP %d. Will retry on the next scheduled check.\n", httpCode);
+        http.end();
+        return;
+    }
+
+    String latestVersion = http.getString();
+    latestVersion.trim();
+    http.end();
+
+    if (latestVersion.length() == 0) {
+        Serial.println(F("[OTA] Version check returned empty - skipping (latest.txt misconfigured?)."));
+        return;
+    }
+
+    if (latestVersion == String(FW_VERSION)) {
+        Serial.println(F("[OTA] Already running the latest version."));
+        return;
+    }
+
+    Serial.print(F("[OTA] New version available: ")); Serial.print(latestVersion);
+    Serial.print(F(" (currently running ")); Serial.print(FW_VERSION); Serial.println(F(")"));
+    Serial.println(F("[OTA] Starting download and flash..."));
+
+    if (Firebase.ready() && signupOK) {
+        Firebase.RTDB.setString(&fbdo, P("/system/otaStatus").c_str(), ("updating to " + latestVersion).c_str());
+    }
+
+    WiFiClientSecure updateClient;
+    updateClient.setInsecure(); // TODO before wide field deployment: pin GitHub's CA cert instead of skipping validation
+    httpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS); // GitHub release asset links 302-redirect to objects.githubusercontent.com
+    httpUpdate.rebootOnUpdate(true); // on success, reboots into the new firmware automatically - the existing bootGuard takes it from there
+
+    // v6.1.0: this call happens from loop(), where the watchdog is tightened to 30s - a ~1-2MB
+    // download+flash over WiFi can easily take longer than that, and httpUpdate.update() does
+    // not pet the watchdog internally (same class of gotcha as WiFiManager's portal wait in
+    // setup()). Widen the budget just for this blocking call, then restore it afterward -
+    // restoring only matters on a FAILED update, since a successful one reboots immediately.
+    esp_task_wdt_config_t otaWdtConfig = { .timeout_ms = 120000, .idle_core_mask = (1 << portNUM_PROCESSORS) - 1, .trigger_panic = true };
+    esp_task_wdt_reconfigure(&otaWdtConfig);
+
+    t_httpUpdate_return ret = httpUpdate.update(updateClient, GITHUB_BINARY_URL);
+
+    otaWdtConfig.timeout_ms = 30000;
+    esp_task_wdt_reconfigure(&otaWdtConfig); // restore normal loop() budget - no-op if we're about to reboot anyway
+
+    switch (ret) {
+        case HTTP_UPDATE_FAILED:
+            Serial.printf("[OTA] Update FAILED (%d): %s. Staying on current firmware.\n", httpUpdate.getLastError(), httpUpdate.getLastErrorString().c_str());
+            if (Firebase.ready() && signupOK) Firebase.RTDB.setString(&fbdo, P("/system/otaStatus").c_str(), "update failed - staying on current firmware");
+            break;
+        case HTTP_UPDATE_NO_UPDATES:
+            Serial.println(F("[OTA] Server reported no update (unexpected - latest.txt said otherwise)."));
+            break;
+        case HTTP_UPDATE_OK:
+            Serial.println(F("[OTA] Flash succeeded - rebooting into new firmware now..."));
+            // Board reboots automatically inside this call; this line may never print.
+            break;
+    }
+}
+
+bool isSystemBusy() {
+    if (pump1Active || fertPumpActive || heldIrrZone != -1 || heldFertZone != -1) return true;
+    if (bwStart > 0 && bwStop > 0) return true;
+    return false;
+}
+
+void maintainNetwork() {
+    if (WiFi.status() != WL_CONNECTED) {
+        if (!wasDisconnected) { 
+            wasDisconnected = true; 
+            wifiDisconnectTime = millis(); 
+            Serial.println(F("[NETWORK] WiFi Connection Lost!"));
+            WiFi.disconnect(); 
+        }
+        
+        if (isSystemBusy()) {
+            return; 
+        }
+
+        static unsigned long lastWifiRetry = 0;
+        if (millis() - lastWifiRetry > 30000) {
+            lastWifiRetry = millis();
+            Serial.println(F("[NETWORK] System Idle. Attempting to reconnect WiFi..."));
+            WiFi.disconnect();
+            WiFi.begin(); // v6.0.0: no hardcoded creds anymore - reconnects using the network WiFiManager saved to flash at setup()
+        }
+
+        return; 
+    } 
+    
+    if (wasDisconnected && WiFi.status() == WL_CONNECTED) {
+        wasDisconnected = false;
+        Serial.println(F("[NETWORK] WiFi Reconnected successfully!"));
+        configTime(19800, 0, "pool.ntp.org", "time.google.com");
+        ntpSyncPending = true;
+        lastNtpAttempt = millis();
+    }
+
+    if (ntpSyncPending) {
+        time_t now = time(nullptr);
+        if (now > 1600000000) {
+            ntpSyncPending = false;
+            Firebase.setSystemTime(now); 
+            Firebase.reconnectWiFi(true); 
+            Serial.println(F("[NETWORK] Time Synced & Firebase Reconnected."));
+        } else if (millis() - lastNtpAttempt > 15000) {
+            ntpSyncPending = false;
+            Serial.println(F("[NETWORK] NTP Sync Timeout after reconnect."));
+        }
+    }
+}
+
+void setup() {
+  Serial.begin(115200); delay(2000);
+
+  // v5.0.1: OTA rollback safety net. esp_ota_mark_app_valid_cancel_rollback() below (called
+  // once this boot proves it can reach WiFi + Firebase) is the *first* line of defense, but it
+  // only helps automatically if the bootloader itself was built with app-rollback support
+  // enabled - that's a build-time flag the stock Arduino IDE toolchain doesn't expose a
+  // checkbox for, so it can't be guaranteed from here without testing the exact board
+  // package in hand. Given these units control live pumps/valves in the field with no easy
+  // physical access, we don't rely on that assumption alone: this counter, stored in NVS
+  // (survives across OTA flashes - separate flash partition from the app itself), tracks
+  // consecutive boots that never reached the healthy checkpoint. After 3 in a row, we
+  // explicitly force a revert to the previous known-good firmware ourselves.
+  bootGuard.begin("otaguard", false);
+  int bootAttempts = bootGuard.getInt("attempts", 0);
+  if (bootAttempts >= 3) {
+      Serial.println(F("[OTA] 3 consecutive boots failed to reach a healthy state - reverting to previous firmware."));
+      bootGuard.putInt("attempts", 0);
+      bootGuard.putBool("justRolledBack", true);
+      esp_ota_mark_app_invalid_rollback_and_reboot(); // reboots into the last known-good OTA partition - does not return
+      delay(5000);
+      ESP.restart(); // only reached if the call above somehow didn't reboot us
+  }
+  bootGuard.putInt("attempts", bootAttempts + 1);
+
+  // v5.0.6: two-phase watchdog budget. The task must be esp_task_wdt_add()'ed right away
+  // (v5.0.5 tried deferring the add() call itself to dodge a slow Firebase.signUp()/begin()
+  // in setup(), but that backfired: the WiFi-connect and NTP loops below call
+  // esp_task_wdt_reset() on every pass, and reset() on a task that was never add()'ed just
+  // logs "task not found" errors instead of doing anything - so it's added immediately again
+  // here, same as before v5.0.5). What actually changes is the TIMEOUT: it starts high to
+  // give the slow, un-petted blocking calls below (WiFiManager's captive portal wait, then
+  // Firebase.signUp()/Firebase.begin()) real headroom, then gets tightened back down to the
+  // normal 30s right before loop() takes over (see the second esp_task_wdt_reconfigure() call
+  // at the end of this function) so ongoing loop() iterations still get caught fast if one
+  // ever hangs.
+  // v6.0.0: raised from 60s to 240s. WiFiManager's autoConnect()/startConfigPortal() blocks
+  // while waiting for a customer to join the setup AP and submit their WiFi credentials, and
+  // it does NOT call esp_task_wdt_reset() internally - a real provisioning wait (customer
+  // walking over, opening the portal, picking a network) can easily take longer than the old
+  // 60s budget, which would panic-reboot the board mid-provisioning. 240s covers a full 180s
+  // config portal timeout (see wm.setConfigPortalTimeout() below) plus normal Firebase
+  // headroom afterward.
+  esp_task_wdt_config_t wdt_config = {
+      .timeout_ms = 240000,
+      .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,
+      .trigger_panic = true
+  };
+  esp_task_wdt_reconfigure(&wdt_config);
+  esp_task_wdt_add(NULL);
+
+  Serial2.begin(9600, SERIAL_8E1, RS485_RX_PIN, RS485_TX_PIN);
+  node.begin(1, Serial2); 
+  
+  digitalWrite(relayMaster, LOW);
+  pinMode(relayMaster, OUTPUT);
+
+  // v2 fix: this used to be a second, separately hardcoded copy of the zone pin numbers
+  // (13,14,17,18,19,21,23,25,26,27) that had to be kept in sync with irrZonePins[]/fertZonePins[]
+  // by hand. It was NOT updated when those arrays were remapped for the S3, which would have
+  // left the real zone/fert pins never configured as OUTPUT at boot. Now it's built directly
+  // from the arrays so it can never drift out of sync again.
+  // v5.1.0: irrZonePins[] removed from this list - those 6 are now MCP23017 expander channels,
+  // not ESP32 GPIOs, and are initialized separately below via mcp.pinMode()/mcp.digitalWrite().
+  int allPins[] = {relay1_pumpMain, relay2_valveMain, relay3_flushIn, relayFertPump,
+                    fertZonePins[0], fertZonePins[1], fertZonePins[2], fertZonePins[3]};
+  for(int i = 0; i < 8; i++) {
+      digitalWrite(allPins[i], HIGH);
+      pinMode(allPins[i], OUTPUT);
+  }
+
+  // v5.1.0: MCP23017 IO expander bring-up for the 6 irrigation zone valves. Same
+  // "pre-load the output value BEFORE switching that channel to output mode" ordering as the
+  // direct-GPIO loop above (mcp.digitalWrite() writes the MCP23017's output latch independently
+  // of its direction register, exactly like Arduino's digitalWrite()/pinMode() do) - this is
+  // what keeps a valve from ever glitching open for even an instant while its channel is being
+  // configured. Every MCP23017 channel resets to INPUT with no pull-up on power-up, so if the
+  // expander doesn't respond here (wrong wiring/address), mcpReady stays false and
+  // controlIrrZoneRelay() will refuse to write to it rather than silently failing later.
+  Wire.begin(MCP_SDA_PIN, MCP_SCL_PIN);
+  if (mcp.begin_I2C(MCP_I2C_ADDR)) {
+      mcpReady = true;
+      for (int i = 0; i < 6; i++) {
+          mcp.digitalWrite(irrZonePins[i], HIGH);
+          mcp.pinMode(irrZonePins[i], OUTPUT);
+      }
+      Serial.println(F("[SETUP] MCP23017 IO expander OK - irrigation zone valves initialized."));
+  } else {
+      Serial.println(F("[SETUP] MCP23017 IO expander NOT DETECTED - check wiring/I2C address. Irrigation zone valves will not respond until this is fixed and the board is rebooted."));
+  }
+
+  // v4: WiFi is no longer hardcoded - the MAC address is what we use as this
+  // unit's permanent device identity.
+  // v5.0.3: WiFi.macAddress() was reading back all-zeros on this board/core
+  // combination - it depends on the WiFi driver already being fully up, and on
+  // this core version that isn't guaranteed to have happened yet right after
+  // WiFi.mode(WIFI_STA). esp_read_mac() reads the same factory-burned MAC
+  // straight from eFuse instead, which is available the instant the chip
+  // powers on - no WiFi driver dependency, no race condition possible.
+  WiFi.mode(WIFI_STA); WiFi.setAutoReconnect(false);
+  uint8_t macBytes[6];
+  esp_read_mac(macBytes, ESP_MAC_WIFI_STA);
+  char macBuf[13];
+  snprintf(macBuf, sizeof(macBuf), "%02X%02X%02X%02X%02X%02X",
+           macBytes[0], macBytes[1], macBytes[2], macBytes[3], macBytes[4], macBytes[5]);
+  String macStr = String(macBuf);
+  deviceId = macStr;
+  devBase = "/devices/" + deviceId;
+  Serial.print(F("[SETUP] Device ID (MAC): ")); Serial.println(deviceId);
+
+  // v6.0.0: REVERTED to WiFiManager zero-touch provisioning - see changelog item 22.
+  // REQUIRES the ESP32 board package downgraded to arduino-esp32 core 3.0.7 in Boards
+  // Manager, or this hits the same tzapu/WiFiManager#1797 crash as before. Each unit boots
+  // its own "SIP-Setup-XXXXXX" access point (last 6 hex chars of its MAC, computed above, so
+  // nearby units can never collide) if it has no saved WiFi credentials yet, or can't
+  // reconnect to the last saved network. The customer connects a phone to that AP,
+  // WiFiManager serves a captive portal to pick the real WiFi network and enter its
+  // password, and those credentials are saved to flash for every future boot - no reflash
+  // per customer, no hardcoded network. setConfigPortalTimeout(180) bounds the wait to 3
+  // minutes so an unattended unit reboots and retries rather than sitting in AP mode
+  // forever; the 240s watchdog budget set above covers that with margin.
+  WiFiManager wm;
+  wm.setConfigPortalTimeout(180);
+  String apName = "SIP-Setup-" + deviceId.substring(6); // e.g. SIP-Setup-A1B2C3
+  Serial.print(F("[SETUP] Starting WiFiManager. Provisioning AP (if needed): ")); Serial.println(apName);
+  bool wifiOk = wm.autoConnect(apName.c_str());
+  if (!wifiOk) {
+      Serial.println(F("[SETUP] WiFiManager: no WiFi credentials configured within the 180s portal timeout - rebooting to retry."));
+      delay(1000);
+      ESP.restart();
+  }
+  Serial.print(F("\n[SETUP] WiFi Connected. IP: ")); Serial.println(WiFi.localIP());
+
+  if (WiFi.status() == WL_CONNECTED) {
+      WiFi.setSleep(false); WiFi.setTxPower(WIFI_POWER_19_5dBm);
+      configTime(19800, 0, "pool.ntp.org", "time.google.com");
+
+      // v5.0.7: this loop used to be completely silent for up to 20s - from the Serial
+      // Monitor it was impossible to tell "still waiting on NTP" apart from "hung/crashed".
+      Serial.print(F("[SETUP] Waiting for NTP time sync"));
+      int timeAttempts = 0;
+      while (time(nullptr) < 100000 && timeAttempts < 40) {
+          esp_task_wdt_reset();
+          delay(500);
+          Serial.print(F("."));
+          timeAttempts++;
+      }
+      if (time(nullptr) < 100000) {
+          Serial.println(F(" FAILED (no reply after 20s - check this WiFi network actually has internet access, not just a local link)."));
+      } else {
+          Serial.print(F(" OK. Epoch: ")); Serial.println((long)time(nullptr));
+      }
+  }
+
+  prefs.begin("irr_state", false);
+  pendingResumeZone = prefs.getInt("z", 0);
+  pendingResumeRemain = prefs.getLong("r", 0);
+
+  config.api_key = API_KEY; config.database_url = DATABASE_URL;
+  // v5.0.7: Firebase.signUp() is a single blocking HTTPS call with no progress output of its
+  // own - on a WiFi network with no real internet route this can sit for a long time with
+  // nothing printed at all. These prints (and the error message on failure) turn that silence
+  // into an actual diagnostic instead of "nothing happens".
+  Serial.println(F("[SETUP] Calling Firebase.signUp()..."));
+  if (Firebase.signUp(&config, &auth, "", "")) {
+      signupOK = true;
+      Serial.println(F("[SETUP] Firebase.signUp() OK."));
+  } else {
+      Serial.print(F("[SETUP] Firebase.signUp() FAILED: "));
+      Serial.println(config.signer.signupError.message.c_str());
+  }
+
+  fbdo.setBSSLBufferSize(4096, 1024);
+  Firebase.setSystemTime(time(nullptr));
+
+  // v5.0.8: only call Firebase.begin() if signUp() actually succeeded above. Previously this
+  // ran unconditionally, so when signUp() failed (e.g. Anonymous sign-in not enabled yet in
+  // Firebase Console -> Authentication -> Sign-in method - this firmware authenticates
+  // anonymously by design, see the SIP-Controller-Multi-Tenant-Setup project doc),
+  // Firebase.begin() still ran with no valid credentials and hung well past even the 60s
+  // setup watchdog budget instead of failing fast - that's what caused the
+  // "Task watchdog...loopTask...Aborting" crash at ~95s in the last log. Skipping it when
+  // signUp already failed turns a bad/missing Firebase config into "runs locally, offline
+  // from the cloud, no crash" instead of a crash loop.
+  if (signupOK) {
+      Serial.println(F("[SETUP] Calling Firebase.begin()..."));
+      Firebase.begin(&config, &auth); Firebase.reconnectWiFi(true);
+      Serial.print(F("[SETUP] Waiting for Firebase.ready()"));
+
+      int timeout = 0;
+      while (!Firebase.ready() && timeout < 20) {
+          esp_task_wdt_reset();
+          delay(500); Serial.print(F(".")); timeout++;
+      }
+      Serial.println(Firebase.ready() ? F(" OK.") : F(" TIMED OUT after 10s."));
+  } else {
+      Serial.println(F("[SETUP] Skipping Firebase.begin() - signUp() failed above, nothing to authenticate with. Running locally without cloud sync this boot; will retry on next reboot."));
+  }
+
+  if (signupOK && Firebase.ready()) {
+     Serial.println(F("\n[SYSTEM] System Booted & Online"));
+     digitalWrite(relayMaster, HIGH);
+     Serial.println(F("[RELAY] Master Relay ON"));
+
+     // v5: this build proved it can boot, connect to WiFi, and reach Firebase on its own -
+     // tell the bootloader this partition is good so it won't be auto-rolled-back. Also
+     // report our own version + clear any stale OTA status left over from before a reboot.
+     esp_ota_mark_app_valid_cancel_rollback();
+     bootGuard.putInt("attempts", 0); // v5.0.1: reached a healthy state - clear the failure counter
+
+     Firebase.RTDB.setString(&fbdo, P("/system/fwVersion").c_str(), FW_VERSION);
+
+     // v5.0.10: autoInterlockActive/autoInterlockReason always start fresh (false/0) in RAM on
+     // every boot, but nothing was telling Firebase to match that - so a stale interlockReason
+     // left over from BEFORE this boot (e.g. a lockout from an earlier session, or from before
+     // the v5.0.9 protEnabled fix existed) would keep showing "PAUSED / Auto-recovery
+     // monitoring in progress" on the dashboard forever, even though the firmware itself never
+     // re-triggered anything this boot. Local state is authoritative right after a clean boot,
+     // so overwrite Firebase with it explicitly instead of leaving whatever was there before.
+     Firebase.RTDB.setInt(&fbdo, P("/system/interlockReason").c_str(), 0);
+
+     if (bootGuard.getBool("justRolledBack", false)) {
+         // v5.0.1: we're booting after the safety net above force-reverted us to this
+         // (previous, known-good) firmware - surface that clearly instead of silently going idle.
+         bootGuard.putBool("justRolledBack", false);
+         Firebase.RTDB.setString(&fbdo, P("/system/otaStatus").c_str(), "rolled_back: previous update failed to come online 3x, reverted automatically");
+         Serial.println(F("[OTA] Recovered via automatic rollback to previous firmware."));
+     } else {
+         Firebase.RTDB.setString(&fbdo, P("/system/otaStatus").c_str(), "idle");
+     }
+  }
+  readSlowFirebaseData();
+
+  // v5.0.6: every slow, one-time, un-petted network call in setup() is done now - tighten
+  // the watchdog back down from the 60s setup-time budget to the normal 30s for loop(),
+  // which pets it every single iteration and should never legitimately need more than that.
+  wdt_config.timeout_ms = 30000;
+  esp_task_wdt_reconfigure(&wdt_config);
+}
+
+unsigned long lastFastUpdate = 0; unsigned long lastSlowUpdate = 0; unsigned long lastHeartbeat = 0; unsigned long lastPzemRead = 0;
+unsigned long lastOtaCheck = 0; // v6.1.0
+
+void loop() {
+  esp_task_wdt_reset(); 
+  
+  unsigned long currentMillis = millis();
+  
+  updateSystem();
+  checkRecurringSchedules();
+  
+  if (currentMillis - lastPzemRead >= 1500) { 
+      lastPzemRead = currentMillis; 
+      readPowerMeterData(); 
+  }
+  
+  maintainNetwork();
+  
+  if (WiFi.status() != WL_CONNECTED) return;
+  
+  if (currentMillis - lastFastUpdate >= 3000 && currentMillis > ignoreFirebaseUntil) { 
+      lastFastUpdate = currentMillis; 
+      readFastFirebaseData(); 
+  }
+  
+  if (currentMillis - lastSlowUpdate >= 30000) { 
+      lastSlowUpdate = currentMillis; 
+      readSlowFirebaseData(); 
+  }
+  
+  if (currentMillis - lastHeartbeat >= 5000) {
+      lastHeartbeat = currentMillis;
+      sendHeartbeat();
+  }
+
+  if (currentMillis - lastOtaCheck >= OTA_CHECK_INTERVAL_MS) { // v6.1.0
+      lastOtaCheck = currentMillis;
+      checkForFirmwareUpdate();
+  }
+}
